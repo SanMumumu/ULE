@@ -97,6 +97,8 @@ class DiT(nn.Module):
         frames=8,            # Number of frames
         learn_sigma=False,
         max_seq_len=4096,
+        teacher_dim=768,     # Hard Code
+        aligned_depth=4,
         **kwargs             # Handle extra args like patch_size if present
     ):
         super().__init__()
@@ -105,6 +107,7 @@ class DiT(nn.Module):
         self.input_size = input_size
         self.image_size = input_size # Compatibility alias for eval.py
         self.frames = frames
+        self.aligned_depth = aligned_depth
         
         self.len_xy = input_size * input_size
         self.len_yt = frames * input_size
@@ -136,6 +139,11 @@ class DiT(nn.Module):
             DiTBlock(hidden_size, num_heads) for _ in range(depth)
         ])
 
+        self.repa_proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, teacher_dim)
+        )
         # 5. Output Layer
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         self.initialize_weights()
@@ -147,11 +155,15 @@ class DiT(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        for module in self.repa_proj.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
-
 
     def get_loss(self, pred, target):
         if self.loss_type == 'l1':
@@ -161,81 +173,95 @@ class DiT(nn.Module):
         else:
             raise NotImplementedError(f"unknown loss type '{self.loss_type}'")
 
-    def forward(self, x, align_target, cond=None, time_input=None, noise=None, align_only=False):
+    def forward(self, x, align_target, cond=None, time_input=None, noises=None, align_only=False):
         """
         x: (N, C, L)
         cond: (N, C, L)
         time_input: (N,)
         """
-        b, device = x.shape[0], x.device
-        if time_input is None:
-            time_input = torch.sigmoid(torch.randn((b,), device=device)) 
-            
-        time_input = time_input.to(device=x.device, dtype=x.dtype)
+        b, device, dtype = x.shape[0], x.device, x.dtype
         
-        if noise is None:
-            noise = torch.randn_like(x)
+        if time_input is None:
+            time_input = torch.sigmoid(torch.randn((b,), device=device, dtype=dtype))
         else:
-            noise = noise.to(device=x.device, dtype=x.dtype)
-            
-        x_1 = x 
-        t_expanded = time_input.view(b, *([1] * (len(x.shape) - 1)))
-        mu_t = t_expanded * x_1 + (1 - t_expanded) * noise
-
-        target_v = x_1 - noise
+            time_input = time_input.to(device=device, dtype=dtype)
+        
+        if noises is None:
+            noises = torch.randn_like(x)
+        else:
+            noises = noises.to(device=device, dtype=dtype)
+         
+        # We use the version with sigma_min for numerical stability   
+        t_expanded = time_input.view(x.shape[0], *([1] * (len(x.shape) - 1)))
+        pred_v = t_expanded * x + (1 - t_expanded) * noises
+        
+        # Calculate target velocity vector
+        target_v = x - noises
 
         # Handle conditioning by concatenation
         if cond is not None:
-            if cond.shape[2] != mu_t.shape[2]:
+            if cond.shape[2] != pred_v.shape[2]:
                  # Safety pad if needed
                  import torch.nn.functional as F
-                 cond = F.pad(cond, (0, mu_t.shape[2] - cond.shape[2]), "constant", 0)
-            mu_t = torch.cat([mu_t, cond], dim=1) # (N, 2*C, L)
+                 cond = F.pad(cond, (0, pred_v.shape[2] - cond.shape[2]), "constant", 0)
+            pred_v = torch.cat([pred_v, cond], dim=1) # (N, 2*C, L)
         
         # (N, C, L) -> (N, L, C)
-        mu_t = mu_t.transpose(1, 2)
+        pred_v = pred_v.transpose(1, 2)
         
         # Embed
-        mu_t = self.x_embedder(mu_t)
+        pred_v = self.x_embedder(pred_v)
         
         # Add Positional Embedding
-        seq_len = mu_t.shape[1]
+        seq_len = pred_v.shape[1]
         if seq_len > self.pos_embed.shape[1]:
              # Handle case where seq_len exceeds max_seq_len (unlikely if configured right)
-             mu_t = mu_t + self.pos_embed[:, :self.pos_embed.shape[1], :] 
+             pred_v = pred_v + self.pos_embed[:, :self.pos_embed.shape[1], :] 
         else:
-             mu_t = mu_t + self.pos_embed[:, :seq_len, :]
+             pred_v = pred_v + self.pos_embed[:, :seq_len, :]
              
         # Add Segment Embedding
-        device = mu_t.device
         seg_indices = torch.cat([
             torch.zeros(self.len_xy, device=device).long(),
             torch.ones(self.len_yt, device=device).long(),
             torch.full((self.len_xt,), 2, device=device).long()
         ])
-        mu_t = mu_t + self.segment_embed[:, seg_indices, :]
+        pred_v = pred_v + self.segment_embed[:, seg_indices, :]
         
         # Timestep
         t_emb = timestep_embedding(time_input, self.x_embedder.out_features)
         t_emb = self.t_embedder(t_emb)
         
-        # Blocks
-        for block in self.blocks:
-            mu_t = block(mu_t, t_emb)
+        proj_loss = torch.tensor(0.0, device=pred_v.device)
+        
+        for i, block in enumerate(self.blocks):
+            pred_v = block(pred_v, t_emb)
             
-        # Output
-        mu_t = self.final_layer(mu_t, t_emb)
-        
-        # (N, L, C) -> (N, C, L)
-        mu_t = mu_t.transpose(1, 2)
-        
-        denoising_loss = self.get_loss(mu_t, target_v)
-        
+            if align_only and (i + 1) == self.aligned_depth:
+                student_feats = self.repa_proj(pred_v)
+                
+                if align_target is not None:
+                    L_teacher = align_target.shape[1]
+                    student_feats = student_feats[:, :L_teacher, :]
+                    
+                    teacher_feats_norm = F.normalize(align_target, dim=-1)
+                    student_feats_norm = F.normalize(student_feats, dim=-1)
+                    proj_loss = -(teacher_feats_norm * student_feats_norm).sum(dim=-1).mean()
+                
+                return {
+                    "proj_loss": proj_loss,
+                    "time_input": time_input,
+                    "noises": noises,
+                }
+                        
+        pred_v = self.final_layer(pred_v, t_emb)
+        pred_v = pred_v.transpose(1, 2)
+        denoising_loss = self.get_loss(pred_v, target_v)
         return {
             "denoising_loss": denoising_loss,
             "proj_loss": proj_loss,
             "time_input": time_input,
-            "noises": noise,
+            "noises": noises,
         }
     
 
@@ -244,16 +270,16 @@ class DiT(nn.Module):
 #################################################################################
 
 def DiT_XL(**kwargs):
-    return DiT(depth=28, hidden_size=1152, num_heads=16, **kwargs)
+    return DiT(depth=28, hidden_size=1152, num_heads=16, aligned_depth=8, **kwargs)
 
 def DiT_L(**kwargs):
-    return DiT(depth=24, hidden_size=1024, num_heads=16, **kwargs)
+    return DiT(depth=24, hidden_size=1024, num_heads=16, aligned_depth=8, **kwargs)
 
 def DiT_B(**kwargs):
-    return DiT(depth=12, hidden_size=768, num_heads=12, **kwargs)
+    return DiT(depth=12, hidden_size=768, num_heads=12, aligned_depth=4, **kwargs)
 
 def DiT_S(**kwargs):
-    return DiT(depth=12, hidden_size=384, num_heads=6, **kwargs)
+    return DiT(depth=12, hidden_size=384, num_heads=6, aligned_depth=4, **kwargs)
 
 DiT_models = {
     'DiT-XL': DiT_XL,

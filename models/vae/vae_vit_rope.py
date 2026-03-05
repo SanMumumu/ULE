@@ -477,7 +477,7 @@ class ViTAutoencoder(nn.Module):
         input = rearrange(input, 'b c (n t) h w -> (b n) c t h w', n=self.splits)
         z, kl_loss = self.encode(input)
         dec = self.decode(z)
-        return z, dec, kl_loss
+        return dec, kl_loss
 
     # Note: `extract` should be updated similarly to `encode` if used, 
     # but `encode` contains the core logic logic required.

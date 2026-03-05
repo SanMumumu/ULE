@@ -14,6 +14,9 @@ from omegaconf import OmegaConf
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+import numpy as np
+import random
+
 from tools.dataloader import get_loaders
 from tools.utils import AverageMeter, setup_distibuted_training, setup_logger, set_random_seed
 
@@ -157,6 +160,33 @@ def get_align_targets(x_pred, teacher_model, align_model_name, patch_size=16, tu
 
     return align_target
 
+def prepare_input(args, x, vae_cond_model=None, vae_pred_model=None):
+    p = np.random.random()
+
+    if p < args.cond_prob:
+        c, x = x[:, :, :args.cond_frames], x[:, :, args.cond_frames:]
+        mask = (c + 1).contiguous().view(c.size(0), -1) ** 2
+        mask = torch.where(mask.sum(dim=-1) > 0, 1, 0).view(-1, 1, 1)
+        with torch.no_grad():
+            z = vae_pred_model.module.extract(x).detach()
+            if vae_cond_model is not None:
+                c = vae_cond_model.module.extract(c).detach()
+            else:
+                c = vae_pred_model.module.extract(c).detach()
+            c = c * mask + torch.zeros_like(c).to(c.device) * (1 - mask)
+    else:
+        c, x_tmp = x[:, :, :args.cond_frames], x[:, :, args.cond_frames:]
+        mask = (c + 1).contiguous().view(c.size(0), -1) ** 2
+        mask = torch.where(mask.sum(dim=-1) > 0, 1, 0).view(-1, 1, 1, 1, 1)
+
+        clip_length = x_tmp.size(2)
+        prefix = random.randint(0, args.cond_frames)
+        x = x[:, :, prefix:prefix + clip_length, :, :] * mask + x_tmp * (1 - mask)
+        with torch.no_grad():
+            z = vae_pred_model.module.extract(x).detach()
+            c = torch.zeros_like(z).to(x.device)
+
+    return z, c
 
 def config_setup(args):
     config = OmegaConf.load(args.vae_config)
@@ -330,17 +360,21 @@ def main(rank, args):
             
             with autocast(enabled=args.amp):
                 # 1). Forward pass: VAE
-                z_cond, x_cond_hat, kl_loss_cond = vae_cond_model(x_cond)
+                x_cond_hat, kl_loss_cond = vae_cond_model(x_cond)
+                z_cond = vae_cond_model.module.extract(x_cond)
                 vae_cond_loss, _, _ = vae_cond_criterion(
                     kl_loss_cond, x_cond, rearrange(x_cond_hat, '(b t) c h w -> b c t h w', b=batch_size),
                     optimizer_idx=0, global_step=it
                 )
                 
-                z_pred, x_traget_hat, kl_loss_pred = vae_pred_model(x_pred)
+                x_traget_hat, kl_loss_pred = vae_pred_model(x_pred)
+                z_pred = vae_pred_model.module.extract(x_pred)
                 vae_pred_loss, _, _ = vae_pred_criterion(
                     kl_loss_pred, x_pred, rearrange(x_traget_hat, '(b t) c h w -> b c t h w', b=batch_size),
                     optimizer_idx=0, global_step=it
                 )
+                
+                z_pred, cond = prepare_input(args, x_vae, vae_cond_model, vae_pred_model)
                 
                 vae_loss = (vae_cond_loss + vae_pred_loss) / accum_iter
                 
@@ -356,7 +390,8 @@ def main(rank, args):
                 
                 # Compute the REPA alignment loss for VAE updates
                 vae_align_outputs = model(
-                    x=x_traget_hat,
+                    x=z_pred,
+                    cond=cond,
                     align_target=align_target,
                     time_input=time_input,
                     noises=noises,
@@ -465,7 +500,7 @@ def parse_args(input_args=None):
     parser.add_argument('--vae_config', type=str, default='configs/test.yaml')
 
     # DiT Args
-    parser.add_argument("--model", type=str, default="DiT-B/2", choices=DiT_models.keys(),
+    parser.add_argument("--model", type=str, default="DiT-B", choices=DiT_models.keys(),
                         help="The model to train.")
     parser.add_argument('--rgb_model', type=str, default='')
     parser.add_argument('--depth_model', type=str, default='')
