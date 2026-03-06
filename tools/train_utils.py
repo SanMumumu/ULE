@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 
 from losses.fm import FlowMatching
 
-# 全局多进程变量
+# Global multiprocessing variables
 _rank = 0  
 _sync_device = None  
 _sync_called = False  

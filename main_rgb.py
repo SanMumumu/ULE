@@ -102,12 +102,13 @@ def main(rank, args):
 
     # ======================== TensorBoard Loss Dictionary ========================
     losses = dict()
+    losses['cond_vae_loss'] = AverageMeter()
+    losses['pred_vae_loss'] = AverageMeter()
+    losses['dit_denoise_loss'] = AverageMeter()
+    losses['dit_repa_loss'] = AverageMeter()
+    losses['disc_loss'] = AverageMeter()
     losses['vae_cond_recon'] = AverageMeter()
     losses['vae_pred_recon'] = AverageMeter()
-    losses['vae_repa'] = AverageMeter()
-    losses['dit_denoise'] = AverageMeter()
-    losses['dit_repa'] = AverageMeter()
-    losses['d_loss'] = AverageMeter()
 
     # ======================== Training Loop ========================
     accum_iter = 3
@@ -158,6 +159,10 @@ def main(rank, args):
                     optimizer_idx=0, global_step=it
                 )
                 
+                with torch.no_grad():
+                    cond_recon_loss = torch.nn.functional.mse_loss(x_cond, rearrange(x_cond_hat, '(b t) c h w -> b c t h w', b=batch_size))
+                    pred_recon_loss = torch.nn.functional.mse_loss(x_pred, rearrange(x_traget_hat, '(b t) c h w -> b c t h w', b=batch_size))
+
                 _, cond = prepare_input(args, x_vae, vae_cond_model, vae_pred_model)
                 vae_loss = (vae_cond_loss + vae_pred_loss) / accum_iter
                 
@@ -175,9 +180,10 @@ def main(rank, args):
             if args.amp: scaler_g.scale(vae_loss).backward()
             else: vae_loss.backward()
 
-            losses['vae_cond_recon'].update(vae_cond_loss.item(), 1)
-            losses['vae_pred_recon'].update(vae_pred_loss.item(), 1)
-            losses['vae_repa'].update(vae_repa_val.item(), 1)
+            losses['cond_vae_loss'].update(vae_cond_loss.item(), 1)
+            losses['pred_vae_loss'].update(vae_pred_loss.item(), 1)
+            losses['vae_cond_recon'].update(cond_recon_loss.item(), 1)
+            losses['vae_pred_recon'].update(pred_recon_loss.item(), 1)
 
             # -------------------------------------------------------------
             # Stage 2: DiT Flow Matching
@@ -204,8 +210,8 @@ def main(rank, args):
             if args.amp: scaler_fm.scale(dit_loss).backward()
             else: dit_loss.backward()
 
-            losses['dit_denoise'].update(dit_denoise_val.item(), 1)
-            losses['dit_repa'].update(dit_repa_val.item(), 1)
+            losses['dit_denoise_loss'].update(dit_denoise_val.item(), 1)
+            losses['dit_repa_loss'].update(dit_repa_val.item(), 1)
 
             if it % accum_iter == accum_iter - 1:
                 if args.amp:
@@ -262,8 +268,8 @@ def main(rank, args):
                 d_loss_total.backward()
                 if it % accum_iter == accum_iter - 1: opt_vae_d.step()
 
-            losses['d_loss'].update(d_loss_total.item() * accum_iter, 1)
-
+            losses['disc_loss'].update(d_loss_total.item() * accum_iter, 1)
+            
         if it % accum_iter == accum_iter - 1 and it // accum_iter >= disc_start:
             disc_opt = not disc_opt
 
@@ -272,20 +278,23 @@ def main(rank, args):
         # =========================================================================
         if rank == 0 and it % 10 == 0:
             if not disc_opt:
-                pbar.set_description(f"VAE Tgt: {losses['vae_pred_recon'].average:.4f} | DiT Denoise: {losses['dit_denoise'].average:.4f}")
+                pbar.set_description(f"VAE: {losses['pred_vae_loss'].average:.3f} | Denoise: {losses['dit_denoise_loss'].average:.3f} | REPA:  {losses['dit_repa_loss'].average:.3f}")
             else:
-                pbar.set_description(f"Disc Loss: {losses['d_loss'].average:.4f}")
+                pbar.set_description(f"Disc Loss: {losses['d_loss'].average:.3f}")
                 
         if it % args.log_freq == 0:
             if rank == 0 and logger is not None:
-                logger.scalar_summary('train/vae_cond_recon', losses['vae_cond_recon'].average, it)
-                logger.scalar_summary('train/vae_pred_recon', losses['vae_pred_recon'].average, it)
-                logger.scalar_summary('train/vae_repa_loss', losses['vae_repa'].average, it)
-                logger.scalar_summary('train/dit_denoise_loss', losses['dit_denoise'].average, it)
-                logger.scalar_summary('train/dit_repa_loss', losses['dit_repa'].average, it)
-                logger.scalar_summary('train/d_loss', losses['d_loss'].average, it)
-                logger.scalar_summary('train/lr_vae', scheduler_vae.get_lr()[0], it)
-                logger.scalar_summary('train/lr_dit', scheduler_dit.get_lr()[0], it)
+                logger.scalar_summary('loss/cond_vae_loss', losses['cond_vae_loss'].average, it)
+                logger.scalar_summary('loss/pred_vae_loss', losses['pred_vae_loss'].average, it)
+                logger.scalar_summary('loss/dit_denoise_loss', losses['dit_denoise_loss'].average, it)
+                logger.scalar_summary('loss/dit_repa_loss', losses['dit_repa_loss'].average, it)
+                logger.scalar_summary('loss/disc_loss', losses['disc_loss'].average, it)
+                
+                logger.scalar_summary('lr/lr_vae', scheduler_vae.get_lr()[0], it)
+                logger.scalar_summary('lr/lr_dit', scheduler_dit.get_lr()[0], it)
+                
+                logger.scalar_summary('recon/vae_cond_recon', losses['vae_cond_recon'].average, it)
+                logger.scalar_summary('recon/vae_pred_recon', losses['vae_pred_recon'].average, it)
 
             for k in losses.keys():
                 losses[k] = AverageMeter()
