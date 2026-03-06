@@ -88,7 +88,7 @@ class FlowMatching(nn.Module):
         return loss, loss_dict
 
     @torch.no_grad()
-    def sample(self, batch_size=16, cond=None, return_intermediates=False):
+    def sample(self, batch_size=16, cond=None):
         # Euler ODE Solver
         device = next(self.model.parameters()).device
         
@@ -97,7 +97,6 @@ class FlowMatching(nn.Module):
         x = torch.randn(shape, device=device)
         
         dt = 1.0 / self.sampling_timesteps
-        intermediates = [x]
         
         for i in range(self.sampling_timesteps):
             t_value = i / self.sampling_timesteps
@@ -108,12 +107,6 @@ class FlowMatching(nn.Module):
             
             # Euler step: x_{t+dt} = x_t + v * dt
             x = x + v_pred * dt
-            
-            if return_intermediates:
-                intermediates.append(x)
-                
-        if return_intermediates:
-            return x, intermediates
         return x
 
 class MMFlowMatching(FlowMatching):

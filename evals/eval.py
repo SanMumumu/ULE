@@ -169,10 +169,11 @@ def eval_autoencoder(rank, model, loader, it, samples, logger=None):
     return fvd.item(), losses['ssim'].average, losses['lpips'].average, losses['psnr'].average
 
 
-def eval_flow_matching(rank, ema_model, ae, ae_cond, loader, it, samples=16, logger=None, frames=16, cond_frames=8,
-                   trajectories=1, sampling_timesteps=50):
+def eval_flow_matching(rank, args, ema_model, ae, ae_cond, loader,
+                       it, logger=None, trajectories=1):
     device = torch.device('cuda', rank)
 
+    frames, cond_frames = args.frames, args.cond_frames
     losses = dict()
     losses['ssim'] = AverageMeter()
     losses['lpips'] = AverageMeter()
@@ -183,9 +184,9 @@ def eval_flow_matching(rank, ema_model, ae, ae_cond, loader, it, samples=16, log
 
     fm_model = FlowMatching(
         ema_model,
-        channels=ema_model.module.fm_model.in_channels,
-        image_size=ema_model.module.fm_model.image_size,
-        sampling_timesteps=sampling_timesteps,
+        channels=args.in_channels,
+        image_size=args.input_size,
+        sampling_timesteps=args.NFE,
         loss_type='l2'
     ).to(device)
     
@@ -200,13 +201,13 @@ def eval_flow_matching(rank, ema_model, ae, ae_cond, loader, it, samples=16, log
     save_samples = 1
     # save as many images(video gif) as possible but not more than 100 (10x10 matrix)
     for i in range(2, 11):
-        save_samples = i * i if samples >= i * i else save_samples
+        save_samples = i * i if args.eval_samples >= i * i else save_samples
     video_grid = (int(np.sqrt(save_samples)), int(np.sqrt(save_samples)))
 
     with torch.no_grad():
         for n, (x, _) in enumerate(tqdm(loader, desc="Evaluating Flow Matching")):
             k = x.size(0)  # batch size
-            if n >= samples // k:  # useful to break earlier in case num samples is not the full dataset
+            if n >= args.eval_samples // k:  # useful to break earlier in case num samples is not the full dataset
                 break
 
             if cond_frames > 0:
@@ -254,7 +255,7 @@ def eval_flow_matching(rank, ema_model, ae, ae_cond, loader, it, samples=16, log
                     gt_embeddings.append(get_fvd_logits(real.numpy(), i3d=i3d, device=device))
                 pred_embeddings.append(get_fvd_logits(pred.cpu().numpy(), i3d=i3d, device=device))
 
-                if i == 0 and len(predictions) < save_samples:  # store some samples for visualization
+                if i == 0 and len(predictions) < save_samples:
                     gts.append(rearrange(x.type(torch.uint8), 'b t c h w -> b c t h w'))
                     predictions.append(rearrange(pred, 'b t h w c -> b c t h w'))
 

@@ -89,52 +89,46 @@ class FinalLayer(nn.Module):
 class DiT(nn.Module):
     def __init__(
         self,
-        input_size=32,       # Latent spatial size (e.g. 32 for 128x128 img)
-        in_channels=4,       # Latent dim
+        input_size=32,       
+        in_channels=4,       
         hidden_size=384,
         depth=12,
         num_heads=6,
-        frames=8,            # Number of frames
+        frames=8,            
         learn_sigma=False,
         max_seq_len=4096,
-        teacher_dim=768,     # Hard Code
+        teacher_dim=768,     
         aligned_depth=4,
-        **kwargs             # Handle extra args like patch_size if present
+        time_scale_factor=1000,
+        **kwargs             
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.input_size = input_size
-        self.image_size = input_size # Compatibility alias for eval.py
+        self.image_size = input_size 
         self.frames = frames
         self.aligned_depth = aligned_depth
+        self.time_scale_factor = time_scale_factor
         
         self.len_xy = input_size * input_size
         self.len_yt = frames * input_size
         self.len_xt = frames * input_size
         self.seq_len = self.len_xy + self.len_yt + self.len_xt
         
-        # Calculate total latent sequence length (L)
-        # L = spatial (H*W) + temporal_yt (T*H) + temporal_xt (T*W)
         self.ae_emb_dim = (input_size * input_size) + (frames * input_size) + (frames * input_size)
 
-        # 1. Input Projection
-        # Input is concatenated with condition: (N, C+C, L)
         self.x_embedder = nn.Linear(in_channels * 2, hidden_size)
         
-        # 2. Timestep Embedding
         self.t_embedder = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
 
-        # 3. Positional Embedding (1D learnable)
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, hidden_size), requires_grad=True)
-        # 3.1 Segment Embedding
         self.segment_embed = nn.Parameter(torch.zeros(1, 3, hidden_size), requires_grad=True)
 
-        # 4. Transformer Blocks
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads) for _ in range(depth)
         ])
@@ -144,10 +138,8 @@ class DiT(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_size, teacher_dim)
         )
-        # 5. Output Layer
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         self.initialize_weights()
-
 
     def initialize_weights(self):
         torch.nn.init.normal_(self.pos_embed, std=0.02)
@@ -166,19 +158,49 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def get_loss(self, pred, target):
-        if self.loss_type == 'l1':
-            return (target - pred).abs().mean()
-        elif self.loss_type == 'l2':
-            return torch.nn.functional.mse_loss(target, pred)
-        else:
-            raise NotImplementedError(f"unknown loss type '{self.loss_type}'")
+        return torch.nn.functional.mse_loss(target, pred)
+
+    def compute_triplane_repa_loss(self, student_feats, align_target, device):
+        """
+        Projects triplane features to 3D voxel space using grid sampling 
+        and computes the cosine similarity against the teacher's target features.
+        """
+        b, _, teacher_dim = student_feats.shape
+        
+        # 1. Reshape triplane 1D sequences back to 2D spatial feature maps
+        xy_plane = student_feats[:, :self.len_xy, :].transpose(1, 2).view(b, teacher_dim, self.input_size, self.input_size)
+        yt_plane = student_feats[:, self.len_xy:self.len_xy+self.len_yt, :].transpose(1, 2).view(b, teacher_dim, self.frames, self.input_size)
+        xt_plane = student_feats[:, self.len_xy+self.len_yt:, :].transpose(1, 2).view(b, teacher_dim, self.frames, self.input_size)
+        
+        # 2. Define standard 3D voxel grid coordinates corresponding to VFM output (T=4, H=8, W=8)
+        t_vfm, h_vfm, w_vfm = 4, 8, 8
+        t = torch.linspace(-1, 1, steps=t_vfm, device=device)
+        y = torch.linspace(-1, 1, steps=h_vfm, device=device)
+        x = torch.linspace(-1, 1, steps=w_vfm, device=device)
+        grid_t, grid_y, grid_x = torch.meshgrid(t, y, x, indexing='ij') 
+        
+        # 3. Construct 2D sampling grids matching grid_sample format (X, Y)
+        grid_xy = torch.stack([grid_x, grid_y], dim=-1).view(1, 1, -1, 2).expand(b, -1, -1, -1) 
+        grid_yt = torch.stack([grid_y, grid_t], dim=-1).view(1, 1, -1, 2).expand(b, -1, -1, -1) 
+        grid_xt = torch.stack([grid_x, grid_t], dim=-1).view(1, 1, -1, 2).expand(b, -1, -1, -1) 
+        
+        # 4. Bilinear interpolation across all planes
+        feat_xy = F.grid_sample(xy_plane, grid_xy, mode='bilinear', align_corners=True).squeeze(2)
+        feat_yt = F.grid_sample(yt_plane, grid_yt, mode='bilinear', align_corners=True).squeeze(2)
+        feat_xt = F.grid_sample(xt_plane, grid_xt, mode='bilinear', align_corners=True).squeeze(2)
+        
+        # 5. Fuse sampled points and compute cosine similarity loss
+        student_feats_aligned = (feat_xy + feat_yt + feat_xt).transpose(1, 2)
+        
+        teacher_feats_norm = F.normalize(align_target, dim=-1)
+        student_feats_norm = F.normalize(student_feats_aligned, dim=-1)
+        
+        # loss ∈ [0.0, 2.0] lower means better
+        proj_loss = 1.0 - (teacher_feats_norm * student_feats_norm).sum(dim=-1).mean()
+        
+        return proj_loss
 
     def forward(self, x, align_target, cond=None, time_input=None, noises=None, align_only=False):
-        """
-        x: (N, C, L)
-        cond: (N, C, L)
-        time_input: (N,)
-        """
         b, device, dtype = x.shape[0], x.device, x.dtype
         
         if time_input is None:
@@ -191,36 +213,26 @@ class DiT(nn.Module):
         else:
             noises = noises.to(device=device, dtype=dtype)
          
-        # We use the version with sigma_min for numerical stability   
         t_expanded = time_input.view(x.shape[0], *([1] * (len(x.shape) - 1)))
         pred_v = t_expanded * x + (1 - t_expanded) * noises
         
-        # Calculate target velocity vector
         target_v = x - noises
 
-        # Handle conditioning by concatenation
         if cond is not None:
             if cond.shape[2] != pred_v.shape[2]:
-                 # Safety pad if needed
-                 import torch.nn.functional as F
                  cond = F.pad(cond, (0, pred_v.shape[2] - cond.shape[2]), "constant", 0)
-            pred_v = torch.cat([pred_v, cond], dim=1) # (N, 2*C, L)
+            pred_v = torch.cat([pred_v, cond], dim=1) 
         
-        # (N, C, L) -> (N, L, C)
         pred_v = pred_v.transpose(1, 2)
         
-        # Embed
         pred_v = self.x_embedder(pred_v)
         
-        # Add Positional Embedding
         seq_len = pred_v.shape[1]
         if seq_len > self.pos_embed.shape[1]:
-             # Handle case where seq_len exceeds max_seq_len (unlikely if configured right)
              pred_v = pred_v + self.pos_embed[:, :self.pos_embed.shape[1], :] 
         else:
              pred_v = pred_v + self.pos_embed[:, :seq_len, :]
              
-        # Add Segment Embedding
         seg_indices = torch.cat([
             torch.zeros(self.len_xy, device=device).long(),
             torch.ones(self.len_yt, device=device).long(),
@@ -228,11 +240,10 @@ class DiT(nn.Module):
         ])
         pred_v = pred_v + self.segment_embed[:, seg_indices, :]
         
-        # Timestep
         t_emb = timestep_embedding(time_input, self.x_embedder.out_features)
         t_emb = self.t_embedder(t_emb)
         
-        proj_loss = torch.tensor(0.0, device=pred_v.device)
+        proj_loss = torch.tensor(0.0, device=device)
         
         for i, block in enumerate(self.blocks):
             pred_v = block(pred_v, t_emb)
@@ -241,12 +252,8 @@ class DiT(nn.Module):
                 student_feats = self.repa_proj(pred_v)
                 
                 if align_target is not None:
-                    L_teacher = align_target.shape[1]
-                    student_feats = student_feats[:, :L_teacher, :]
-                    
-                    teacher_feats_norm = F.normalize(align_target, dim=-1)
-                    student_feats_norm = F.normalize(student_feats, dim=-1)
-                    proj_loss = -(teacher_feats_norm * student_feats_norm).sum(dim=-1).mean()
+                    # Invoke encapsulated alignment logic
+                    proj_loss = self.compute_triplane_repa_loss(student_feats, align_target, device)
                 
                 return {
                     "proj_loss": proj_loss,
@@ -257,16 +264,87 @@ class DiT(nn.Module):
         pred_v = self.final_layer(pred_v, t_emb)
         pred_v = pred_v.transpose(1, 2)
         denoising_loss = self.get_loss(pred_v, target_v)
+        
         return {
             "denoising_loss": denoising_loss,
             "proj_loss": proj_loss,
             "time_input": time_input,
             "noises": noises,
         }
+        
+        
+    @torch.no_grad()
+    def sample(self, batch_size=16, cond=None):
+        # Euler ODE Solver
+        device = next(self.model.parameters()).device
+        
+        # Initial noise x_0
+        shape = (batch_size, self.channels, self.image_size)
+        x = torch.randn(shape, device=device)
+        
+        dt = 1.0 / self.sampling_timesteps
+        
+        for i in range(self.sampling_timesteps):
+            t_value = i / self.sampling_timesteps
+            t = torch.full((batch_size,), t_value, device=device)
+            
+            # Predict velocity field v
+            t = t * self.time_scale_factor
+            
+            ############
+            # Handle conditioning by concatenation
+            if cond is not None:
+                if cond.shape[2] != x.shape[2]:
+                    # Safety pad if needed
+                    import torch.nn.functional as F
+                    cond = F.pad(cond, (0, x.shape[2] - cond.shape[2]), "constant", 0)
+                x = torch.cat([x, cond], dim=1) # (N, 2*C, L)
+            
+            # (N, C, L) -> (N, L, C)
+            x = x.transpose(1, 2)
+            
+            # Embed
+            x = self.x_embedder(x)
+            
+            # Add Positional Embedding
+            seq_len = x.shape[1]
+            if seq_len > self.pos_embed.shape[1]:
+                # Handle case where seq_len exceeds max_seq_len (unlikely if configured right)
+                x = x + self.pos_embed[:, :self.pos_embed.shape[1], :] 
+            else:
+                x = x + self.pos_embed[:, :seq_len, :]
+                
+            # Add Segment Embedding
+            device = x.device
+            seg_indices = torch.cat([
+                torch.zeros(self.len_xy, device=device).long(),
+                torch.ones(self.len_yt, device=device).long(),
+                torch.full((self.len_xt,), 2, device=device).long()
+            ])
+            x = x + self.segment_embed[:, seg_indices, :]
+            
+            # Timestep
+            t_emb = timestep_embedding(t, self.x_embedder.out_features)
+            t_emb = self.t_embedder(t_emb)
+            
+            # Blocks
+            for block in self.blocks:
+                x = block(x, t_emb)
+                
+            # Output
+            x = self.final_layer(x, t_emb)
+            
+            # (N, L, C) -> (N, C, L)
+            x = x.transpose(1, 2)
+            ############
+                      
+            # Euler step: x_{t+dt} = x_t + v * dt
+            x = x + v_pred * dt
+        return x
     
 
 #################################################################################
-#                                   DiT Configs                                  #
+#                                   DiT Configs                                 #
 #################################################################################
 
 def DiT_XL(**kwargs):
