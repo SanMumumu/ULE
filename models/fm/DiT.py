@@ -274,73 +274,46 @@ class DiT(nn.Module):
         
         
     @torch.no_grad()
-    def sample(self, batch_size=16, cond=None):
-        # Euler ODE Solver
-        device = next(self.model.parameters()).device
+    def forward_sampling(self, x, cond, time_input):
+        """
+        专门用于推理和采样的前向传播（跳过加噪和Loss计算，直接输出速度预测 v）
+        x: 当前的 noisy latent [B, C, L]
+        cond: 条件特征 [B, C, L]
+        time_input: 时间步 [B,]
+        """
+        device = x.device
+        pred_v = x
+
+        if cond is not None:
+            if cond.shape[2] != pred_v.shape[2]:
+                 cond = F.pad(cond, (0, pred_v.shape[2] - cond.shape[2]), "constant", 0)
+            pred_v = torch.cat([pred_v, cond], dim=1) 
         
-        # Initial noise x_0
-        shape = (batch_size, self.channels, self.image_size)
-        x = torch.randn(shape, device=device)
+        pred_v = pred_v.transpose(1, 2)
+        pred_v = self.x_embedder(pred_v)
         
-        dt = 1.0 / self.sampling_timesteps
+        seq_len = pred_v.shape[1]
+        if seq_len > self.pos_embed.shape[1]:
+             pred_v = pred_v + self.pos_embed[:, :self.pos_embed.shape[1], :] 
+        else:
+             pred_v = pred_v + self.pos_embed[:, :seq_len, :]
+             
+        seg_indices = torch.cat([
+            torch.zeros(self.len_xy, device=device).long(),
+            torch.ones(self.len_yt, device=device).long(),
+            torch.full((self.len_xt,), 2, device=device).long()
+        ])
+        pred_v = pred_v + self.segment_embed[:, seg_indices, :]
         
-        for i in range(self.sampling_timesteps):
-            t_value = i / self.sampling_timesteps
-            t = torch.full((batch_size,), t_value, device=device)
-            
-            # Predict velocity field v
-            t = t * self.time_scale_factor
-            
-            ############
-            # Handle conditioning by concatenation
-            if cond is not None:
-                if cond.shape[2] != x.shape[2]:
-                    # Safety pad if needed
-                    import torch.nn.functional as F
-                    cond = F.pad(cond, (0, x.shape[2] - cond.shape[2]), "constant", 0)
-                x = torch.cat([x, cond], dim=1) # (N, 2*C, L)
-            
-            # (N, C, L) -> (N, L, C)
-            x = x.transpose(1, 2)
-            
-            # Embed
-            x = self.x_embedder(x)
-            
-            # Add Positional Embedding
-            seq_len = x.shape[1]
-            if seq_len > self.pos_embed.shape[1]:
-                # Handle case where seq_len exceeds max_seq_len (unlikely if configured right)
-                x = x + self.pos_embed[:, :self.pos_embed.shape[1], :] 
-            else:
-                x = x + self.pos_embed[:, :seq_len, :]
-                
-            # Add Segment Embedding
-            device = x.device
-            seg_indices = torch.cat([
-                torch.zeros(self.len_xy, device=device).long(),
-                torch.ones(self.len_yt, device=device).long(),
-                torch.full((self.len_xt,), 2, device=device).long()
-            ])
-            x = x + self.segment_embed[:, seg_indices, :]
-            
-            # Timestep
-            t_emb = timestep_embedding(t, self.x_embedder.out_features)
-            t_emb = self.t_embedder(t_emb)
-            
-            # Blocks
-            for block in self.blocks:
-                x = block(x, t_emb)
-                
-            # Output
-            x = self.final_layer(x, t_emb)
-            
-            # (N, L, C) -> (N, C, L)
-            x = x.transpose(1, 2)
-            ############
-                      
-            # Euler step: x_{t+dt} = x_t + v * dt
-            x = x + v_pred * dt
-        return x
+        t_emb = timestep_embedding(time_input, self.x_embedder.out_features)
+        t_emb = self.t_embedder(t_emb)
+        
+        for block in self.blocks:
+            pred_v = block(pred_v, t_emb)
+                        
+        pred_v = self.final_layer(pred_v, t_emb)
+        pred_v = pred_v.transpose(1, 2)
+        return pred_v
     
 
 #################################################################################

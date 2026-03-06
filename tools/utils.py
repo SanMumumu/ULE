@@ -44,14 +44,14 @@ class Logger(object):
         self.log_file.write('[%s] %s' % (datetime.now(), string) + '\n')
         self.log_file.flush()
 
-        print('[%s] %s' % (datetime.now(), string))
+        print('\033[94m[%s]\033[0m %s' % (datetime.now(), string))
         sys.stdout.flush()
 
     def log_dirname(self, string):
         self.log_file.write('%s (%s)' % (string, self.logdir) + '\n')
         self.log_file.flush()
 
-        print('%s (%s)' % (string, self.logdir))
+        print('%s (\033[94m%s\033[0m)' % (string, self.logdir))
         sys.stdout.flush()
 
     def scalar_summary(self, tag, value, step):
