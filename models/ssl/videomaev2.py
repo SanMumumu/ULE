@@ -513,9 +513,9 @@ class VisionTransformer(nn.Module):
                 new_state_dict[new_key] = value
 
         missing_keys, unexpected_keys = self.load_state_dict(new_state_dict, strict=False)
-        print(f'Missing keys: {missing_keys}') 
-        print(f'Unexpected keys: !\n {unexpected_keys}')   
-        print("Model weights loaded successfully.")
+        print(f'====================== Load VideoMAEv2 ======================') 
+        print(f'Missing keys: {missing_keys}, Unexpected keys: !\n {unexpected_keys}') 
+        print(f'============= Model weights loaded successfully =============') 
         
         if self.target_resolution[0] != self.img_size or self.target_resolution[1] != self.img_size:
             print("Interpolating position embedding...")

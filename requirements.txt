@@ -37,3 +37,4 @@ gdown
 einops
 torchmetrics
 termcolor
+scikit-image

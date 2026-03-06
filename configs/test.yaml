@@ -2,9 +2,9 @@ vae:
   resume: False
   amp: True
   base_learning_rate: 1.0e-4
-  max_iter: 1000000
+  max_iter: 200000
   log_freq: 1000
-  eval_freq: 10000
+  eval_freq: 5000
   eval_samples: 4
   params:
     embed_dim: 4
@@ -24,11 +24,11 @@ vae:
 model:
   base_learning_rate: 1.0e-4
   cond_prob: 0.7
-  eval_freq: 10000
+  eval_freq: 5000
   eval_samples : 4
   log_freq: 1000
   resume: False
-  max_iter: 1000000
+  max_iter: 200000
   params:
     linear_start: 0.0015
     linear_end: 0.0195
