@@ -51,17 +51,160 @@ def update_ema(ema_model, model, decay=0.9999):
         else:
             ema_buffers[name].copy_(buffer)
 
+def compute_psnr(a, b):
+    mse = torch.mean((a - b) ** 2)
+    if mse == 0: return 100.0
+    return 10 * torch.log10(1.0 / mse).item()
+
+@torch.no_grad()
+def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device, it, logger, log_):
+    """
+    Quantitative evaluation on the validation set: PSNR, SSIM, LPIPS, FVD.
+    """
+    try:
+        from evals.fvd.fvd import calculate_fvd
+        from losses.lpips import LPIPS
+        from skimage.metrics import structural_similarity as ssim_func
+        import numpy as np
+    except ImportError as e:
+        log_(f"❌ Failed to import evaluation libraries (check skimage, scipy, etc.): {e}")
+        return
+
+    log_(f"🚀 Running quantitative evaluation (target samples: {args.eval_samples})...")
+    
+    lpips_fn = LPIPS().eval().to(device)
+    
+    all_reals = []
+    all_preds = []
+    num_samples = 0
+    
+    for x_val, _ in val_loader:
+        if num_samples >= args.eval_samples:
+            break
+            
+        b_vis = x_val.size(0)
+        x_val = x_val.to(device)
+        x_vae_val = rearrange(x_val / 127.5 - 1, 'b t c h w -> b c t h w') 
+        
+        x_cond_val = x_vae_val[:, :, :args.cond_frames] 
+        x_pred_val = x_vae_val[:, :, args.cond_frames : args.cond_frames + args.frames]
+        
+        c_feat_val = vae_cond_model.module.extract(x_cond_val).detach()
+        
+        unwrapped_ema = ema.module if hasattr(ema, 'module') else ema
+        true_seq_len = unwrapped_ema.ae_emb_dim
+        
+        fm_sampler = FlowMatching(
+            FMSamplingWrapper(ema), channels=args.in_channels, image_size=true_seq_len, sampling_timesteps=50
+        ).to(device)
+        
+        z_sampled_val = fm_sampler.sample(batch_size=b_vis, cond=c_feat_val)
+        
+        if hasattr(vae_pred_model.module, 'decode_from_sample'):
+            pred_vis_val = vae_pred_model.module.decode_from_sample(z_sampled_val)
+        else:
+            out_vis_val = vae_pred_model.module.decode(z_sampled_val)
+            pred_vis_val = out_vis_val.sample if hasattr(out_vis_val, 'sample') else out_vis_val
+            
+        pred_vis_val = pred_vis_val.clamp(-1.0, 1.0)
+        
+        if pred_vis_val.dim() == 4:
+            T_pred = pred_vis_val.shape[0] // b_vis
+            pred_vis_val = pred_vis_val.view(b_vis, T_pred, pred_vis_val.shape[1], pred_vis_val.shape[2], pred_vis_val.shape[3])
+            pred_vis_val = pred_vis_val.permute(0, 2, 1, 3, 4)
+            
+        min_T = min(x_pred_val.shape[2], pred_vis_val.shape[2])
+        
+        real_vid = x_pred_val[:, :, :min_T, :, :].cpu().permute(0, 2, 1, 3, 4)
+        gen_vid = pred_vis_val[:, :, :min_T, :, :].cpu().permute(0, 2, 1, 3, 4)
+        
+        all_reals.append(real_vid)
+        all_preds.append(gen_vid)
+        
+        num_samples += b_vis
+
+    if len(all_reals) == 0:
+        return
+
+    reals_btchw = torch.cat(all_reals, dim=0)[:args.eval_samples]
+    preds_btchw = torch.cat(all_preds, dim=0)[:args.eval_samples]
+    
+    reals_01 = (reals_btchw + 1.0) / 2.0
+    preds_01 = (preds_btchw + 1.0) / 2.0
+    
+    try:
+        # =======================================================
+        # 1. Compute PSNR
+        # =======================================================
+        psnr_val = compute_psnr(reals_01, preds_01)
+        
+        # =======================================================
+        # 2. Compute SSIM
+        # =======================================================
+        reals_np = reals_01.numpy()
+        preds_np = preds_01.numpy()
+        B, T, C, H, W = reals_np.shape
+        ssim_sum = 0.0
+        for b in range(B):
+            for t in range(T):
+                img1 = np.transpose(reals_np[b, t], (1, 2, 0)) 
+                img2 = np.transpose(preds_np[b, t], (1, 2, 0))
+                s = ssim_func(img1, img2, data_range=1.0, channel_axis=-1)
+                ssim_sum += s
+        ssim_val = ssim_sum / (B * T)
+        
+        # =======================================================
+        # 3. Compute LPIPS
+        # =======================================================
+        reals_11 = reals_01 * 2 - 1
+        preds_11 = preds_01 * 2 - 1
+        lpips_sum = 0.0
+        for b in range(B):
+            r_f = reals_11[b].to(device)
+            p_f = preds_11[b].to(device)
+            with torch.no_grad():
+                lpips_sum += lpips_fn(r_f, p_f).mean().item()
+        lpips_val = lpips_sum / B
+        del lpips_fn
+        
+        # =======================================================
+        # 4. Compute FVD 
+        # =======================================================
+        reals_uint8 = (reals_01 * 255).clamp(0, 255).to(torch.uint8).to(device)
+        preds_uint8 = (preds_01 * 255).clamp(0, 255).to(torch.uint8).to(device)
+        
+        try:
+            fvd_val = calculate_fvd(reals_uint8, preds_uint8, device)
+            if isinstance(fvd_val, torch.Tensor): fvd_val = fvd_val.item()
+        except Exception as e:
+            log_(f"⚠️ FVD calculation failed, skipping this metric: {str(e)}")
+            fvd_val = 0.0
+            
+        log_(f"✅ [Eval Report Step {it}] PSNR: {psnr_val:.4f} | SSIM: {ssim_val:.4f} | LPIPS: {lpips_val:.4f} | FVD: {fvd_val:.4f}")
+        
+        if logger is not None:
+            logger.scalar_summary('eval/psnr', psnr_val, it)
+            logger.scalar_summary('eval/ssim', ssim_val, it)
+            logger.scalar_summary('eval/lpips', lpips_val, it)
+            logger.scalar_summary('eval/fvd', fvd_val, it)
+
+    except Exception as e:
+        log_(f"❌ Evaluation process exception: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+    finally:
+        torch.cuda.empty_cache()
+
 class FMSamplingWrapper(nn.Module):
     def __init__(self, dit_model):
         super().__init__()
-        # 兼容 DDP 和 EMA 提取原始的 DiT 模块
         self.dit_model = dit_model.module if hasattr(dit_model, 'module') else dit_model
 
     def forward(self, x, cond, t):
         return self.dit_model.forward_sampling(x, cond, t)
     
 def save_image_grid(img, fname, drange, grid_size=None, normalize=True):
-    """提取自 triflow 官方 eval.py 的保存逻辑"""
     import numpy as np
     from PIL import Image
     if normalize:
@@ -71,7 +214,7 @@ def save_image_grid(img, fname, drange, grid_size=None, normalize=True):
         img = np.rint(img).clip(0, 255).astype(np.uint8)
 
     B, C, T, H, W = img.shape
-    img = img.transpose(0, 3, 2, 4, 1) # 转换为 [B, H, T, W, C]
+    img = img.transpose(0, 3, 2, 4, 1) 
     img = img.reshape(B * H, T * W, C)
     if C == 1:
         img = np.repeat(img, 3, axis=2)
@@ -80,14 +223,13 @@ def save_image_grid(img, fname, drange, grid_size=None, normalize=True):
     result_img.save(fname, quality=95)
 
 def log_videos_e2e(gts, predictions, it, save_dir):
-    """将预测视频与真实视频上下拼接并保存"""
+    """Concatenate and save ground truth and predicted videos"""
     import numpy as np
     import os
-    # 强制 detach 剥离计算图，防止 requires_grad 报错
+
     gts_np = gts.detach().cpu().numpy()
     preds_np = predictions.detach().cpu().numpy()
 
-    # 堆叠并在 batch 维度展开，结果形状 [B*2, C, T, H, W]
     combined = np.stack([gts_np, preds_np], axis=1)
     combined = combined.reshape(-1, *gts_np.shape[1:])
 
@@ -291,7 +433,7 @@ def main(rank, args):
     scaler_d = torch.amp.GradScaler('cuda') if args.amp else None
     scaler_fm = torch.amp.GradScaler('cuda') if args.amp else None
 
-    # ======================== TensorBoard 损失记录字典 ========================
+    # ======================== TensorBoard Loss Dictionary ========================
     losses = dict()
     losses['vae_cond_recon'] = AverageMeter()
     losses['vae_pred_recon'] = AverageMeter()
@@ -352,7 +494,7 @@ def main(rank, args):
                 _, cond = prepare_input(args, x_vae, vae_cond_model, vae_pred_model)
                 vae_loss = (vae_cond_loss + vae_pred_loss) / accum_iter
                 
-                # 关键修复1：冻结的 DiT 如果通过 DDP forward 会狂报警告，这里必须使用 .module 绕过 DDP包装器
+                # Fix: Use .module to bypass DDP wrapper for frozen DiT to avoid warnings
                 vae_align_outputs = model.module(
                     x=z_pred, cond=cond, align_target=align_target,
                     time_input=None, noises=None, align_only=True
@@ -367,7 +509,6 @@ def main(rank, args):
             if args.amp: scaler_g.scale(vae_loss).backward()
             else: vae_loss.backward()
 
-            # 收集 Stage 1 损失
             losses['vae_cond_recon'].update(vae_cond_loss.item(), 1)
             losses['vae_pred_recon'].update(vae_pred_loss.item(), 1)
             losses['vae_repa'].update(vae_repa_val.item(), 1)
@@ -384,7 +525,6 @@ def main(rank, args):
             cond_detached = cond.detach()
             
             with torch.autocast(device_type='cuda', enabled=args.amp):
-                # 解冻的 DiT 需要用带有梯度的 DDP wrapper
                 sit_outputs = model(
                     x=z_pred_detached, cond=cond_detached, align_target=align_target,
                     time_input=time_input, noises=noises, align_only=False
@@ -398,7 +538,6 @@ def main(rank, args):
             if args.amp: scaler_fm.scale(dit_loss).backward()
             else: dit_loss.backward()
 
-            # 收集 Stage 2 损失
             losses['dit_denoise'].update(dit_denoise_val.item(), 1)
             losses['dit_repa'].update(dit_repa_val.item(), 1)
 
@@ -438,7 +577,7 @@ def main(rank, args):
                 
             with torch.autocast(device_type='cuda', enabled=args.amp):
                 with torch.no_grad(): 
-                    # 关键修复2：无梯度的验证层不能穿过 DDP wrapper，否则会无限发警告，加上 .module
+                    # Fix: Use .module for eval layers to avoid DDP warnings
                     x_pred_tilde, vq_loss_pred = vae_pred_model.module(x_pred)
                     x_cond_tilde, vq_loss_cond = vae_cond_model.module(x_cond)
                 
@@ -460,14 +599,13 @@ def main(rank, args):
                 d_loss_total.backward()
                 if it % accum_iter == accum_iter - 1: opt_vae_d.step()
 
-            # 收集 Stage 3 损失
             losses['d_loss'].update(d_loss_total.item() * accum_iter, 1)
 
         if it % accum_iter == accum_iter - 1 and it // accum_iter >= disc_start:
             disc_opt = not disc_opt
 
         # =========================================================================
-        # 🟢 TensorBoard 写入与 Tqdm 更新
+        # TensorBoard & Tqdm Updates
         # =========================================================================
         if rank == 0 and it % 10 == 0:
             if not disc_opt:
@@ -476,7 +614,6 @@ def main(rank, args):
                 pbar.set_description(f"Disc Loss: {losses['d_loss'].average:.4f}")
                 
         if it % args.log_freq == 0:
-            # 只有 rank 0 写日志
             if rank == 0 and logger is not None:
                 logger.scalar_summary('train/vae_cond_recon', losses['vae_cond_recon'].average, it)
                 logger.scalar_summary('train/vae_pred_recon', losses['vae_pred_recon'].average, it)
@@ -488,39 +625,35 @@ def main(rank, args):
                 logger.scalar_summary('train/lr_vae', scheduler_vae.get_lr()[0], it)
                 logger.scalar_summary('train/lr_dit', scheduler_dit.get_lr()[0], it)
 
-            # 所有进程必须一起清空缓存的 Meter，防止内存泄漏或数据不同步
+            # Clear cached Meters across all processes to prevent memory leaks or desync
             for k in losses.keys():
                 losses[k] = AverageMeter()
 
         # =========================================================================
-        # 🟢 每 1000 轮：生成视频并保存可视化结果 (极度安全版)
+        # Periodic Video Generation and Visualization
         # =========================================================================
-        if rank == 0 and it % 1 == 0 and it > 0:
+        if rank == 0 and it % args.eval_freq == 0 and it > 0:
             ema.eval()
             with torch.no_grad():
                 try:
-                    # 1. 强制 B=1 并且释放不必要的梯度，防止 OOM 显存溢出
                     b_vis = 1
                     c_init_vis = x_cond[:b_vis].clone()
-                    gt_pred_vis = x_pred[:b_vis].clone().cpu() # 真实视频 [B, C, T, H, W]
+                    gt_pred_vis = x_pred[:b_vis].clone().cpu()
                     
-                    # 2. 提取条件特征
                     c_feat_vis = vae_cond_model.module.extract(c_init_vis).detach()
                     
                     unwrapped_ema = ema.module if hasattr(ema, 'module') else ema
                     true_seq_len = unwrapped_ema.ae_emb_dim
-                    # 3. 初始化采样器
+                    
                     fm_sampler = FlowMatching(
                         FMSamplingWrapper(ema), 
                         channels=args.in_channels, 
-                        image_size=true_seq_len, # <--- 关键修复：把 args.input_size 改成了真实的 1536
+                        image_size=true_seq_len, 
                         sampling_timesteps=50
                     ).to(device)
                     
-                    # 4. 生成采样
                     z_sampled = fm_sampler.sample(batch_size=b_vis, cond=c_feat_vis)
                     
-                    # 5. VAE 解码
                     if hasattr(vae_pred_model.module, 'decode_from_sample'):
                         pred_vis = vae_pred_model.module.decode_from_sample(z_sampled)
                     else:
@@ -529,54 +662,36 @@ def main(rank, args):
                         
                     pred_vis = pred_vis.clamp(-1.0, 1.0).cpu()
                     
-                    # 6. 自动对齐维度 (解决 VAE 输出 [(B*T), C, H, W] 展平导致的问题)
                     if pred_vis.dim() == 4:
-                        # 自动推断真实的帧数 T
                         T_pred = pred_vis.shape[0] // b_vis
-                        # Reshape 回 [B, T, C, H, W] 然后转置为 [B, C, T, H, W]
                         pred_vis = pred_vis.view(b_vis, T_pred, pred_vis.shape[1], pred_vis.shape[2], pred_vis.shape[3])
                         pred_vis = pred_vis.permute(0, 2, 1, 3, 4)
                         
-                    # 7. 确保 GT 和 Pred 的时间帧数强行对齐，取较小值
                     min_T = min(gt_pred_vis.shape[2], pred_vis.shape[2])
                     gt_pred_vis = gt_pred_vis[:, :, :min_T, :, :]
                     pred_vis = pred_vis[:, :, :min_T, :, :]
                     
-                    # 8. 使用 PyTorch 原生排列进行网格拼接 (绝对安全)
-                    # 把 GT 和 Pred 叠放在一起，形状: [B, 2, C, T, H, W]
                     combined = torch.stack([gt_pred_vis, pred_vis], dim=1) 
                     
-                    # 维度变换: [B, 2, T, C, H, W] -> 展平为单张图片流 [(B * 2 * T), C, H, W]
                     flat_combined = combined.permute(0, 1, 3, 2, 4, 5).contiguous()
                     flat_combined = flat_combined.view(-1, flat_combined.shape[3], flat_combined.shape[4], flat_combined.shape[5])
                     
-                    # 从 [-1, 1] 映射到 [0, 1] 以便保存
                     flat_combined = (flat_combined + 1.0) / 2.0
                     flat_combined = flat_combined.clamp(0.0, 1.0)
                     
                     save_path = os.path.join(args.output, f'vis_e2e_{it:07d}.png')
-                    # nrow=min_T 保证每一行正好是一个完整视频的时间帧
                     torchvision.utils.save_image(flat_combined, save_path, nrow=min_T, normalize=False)
                     
                 except Exception as e:
-                    # 如果还是报错，直接把错误打印到终端，但绝不终止你的训练！
-                    log_(f"❌ 可视化阶段发生错误 (已跳过): {str(e)}")
+                    log_(f"❌ Visualization error (skipped): {str(e)}")
                     import traceback
                     traceback.print_exc()
                 
                 finally:
-                    # 无论成功还是失败，强制清理显存，保证下一次训练 batch 顺利进行
                     torch.cuda.empty_cache()
 
-            # if logger is not None and rank == 0:
-            #     logger.scalar_summary('test/fvd', fvd, it)
-            #     logger.scalar_summary('test/ssim', ssim, it)
-            #     logger.scalar_summary('test/lpips', lpips, it)
-            #     log_('[It %d] [FVD PRED %f] [SSIM %.2f] [LPIPS %.2f]' %
-            #          (it, fvd, ssim, lpips))
-
         # =========================================================================
-        # 🟢 每 10,000 轮：保存完整的模型 Checkpoints
+        # Save Model Checkpoints
         # =========================================================================
         if rank == 0 and it % 10000 == 0 and it > 0:
             ckpt_path = os.path.join(args.output, f'ckpt_{it:07d}.pt')
@@ -591,6 +706,30 @@ def main(rank, args):
                 'it': it,
             }, ckpt_path)
             log_(f"Saved full checkpoint to: {ckpt_path}")
+            
+        # =========================================================================
+        # Quantitative Evaluation
+        # =========================================================================
+        if rank == 0 and it % args.eval_freq == 0 and it > 0:
+            ema.eval()
+            vae_cond_model.eval()
+            vae_pred_model.eval()
+            
+            run_evaluation(
+                val_loader=val_loader,
+                ema=ema,
+                vae_cond_model=vae_cond_model,
+                vae_pred_model=vae_pred_model,
+                args=args,
+                device=device,
+                it=it,
+                logger=logger,
+                log_=log_
+            )
+            
+            ema.train()
+            vae_cond_model.train()
+            vae_pred_model.train()
 
     pbar.close()
 
