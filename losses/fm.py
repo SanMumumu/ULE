@@ -103,7 +103,7 @@ class FlowMatching(nn.Module):
             t = torch.full((batch_size,), t_value, device=device)
             
             # Predict velocity field v
-            v_pred = self.model(x, cond, t * self.time_scale_factor)
+            v_pred = self.model(x, cond, t)
             
             # Euler step: x_{t+dt} = x_t + v * dt
             x = x + v_pred * dt

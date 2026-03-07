@@ -104,6 +104,7 @@ def main(rank, args):
     losses = dict()
     losses['cond_vae_loss'] = AverageMeter()
     losses['pred_vae_loss'] = AverageMeter()
+    losses['vae_repa_loss'] = AverageMeter()
     losses['dit_denoise_loss'] = AverageMeter()
     losses['dit_repa_loss'] = AverageMeter()
     losses['disc_loss'] = AverageMeter()
@@ -182,6 +183,7 @@ def main(rank, args):
 
             losses['cond_vae_loss'].update(vae_cond_loss.item(), 1)
             losses['pred_vae_loss'].update(vae_pred_loss.item(), 1)
+            losses['vae_repa_loss'].update(vae_repa_val.item(), 1)
             losses['vae_cond_recon'].update(cond_recon_loss.item(), 1)
             losses['vae_pred_recon'].update(pred_recon_loss.item(), 1)
 
@@ -278,7 +280,7 @@ def main(rank, args):
         # =========================================================================
         if rank == 0 and it % 10 == 0:
             if not disc_opt:
-                pbar.set_description(f"VAE: {losses['pred_vae_loss'].average:.3f} | Denoise: {losses['dit_denoise_loss'].average:.3f} | REPA:  {losses['dit_repa_loss'].average:.3f}")
+                pbar.set_description(f"VAE: {losses['pred_vae_loss'].average:.3f} | Denoise: {losses['dit_denoise_loss'].average:.3f} | REPA:  {losses['vae_repa_loss'].average:.3f}")
             else:
                 pbar.set_description(f"Disc Loss: {losses['d_loss'].average:.3f}")
                 
@@ -286,6 +288,7 @@ def main(rank, args):
             if rank == 0 and logger is not None:
                 logger.scalar_summary('loss/cond_vae_loss', losses['cond_vae_loss'].average, it)
                 logger.scalar_summary('loss/pred_vae_loss', losses['pred_vae_loss'].average, it)
+                logger.scalar_summary('loss/vae_repa_loss', losses['vae_repa_loss'].average, it)
                 logger.scalar_summary('loss/dit_denoise_loss', losses['dit_denoise_loss'].average, it)
                 logger.scalar_summary('loss/dit_repa_loss', losses['dit_repa_loss'].average, it)
                 logger.scalar_summary('loss/disc_loss', losses['disc_loss'].average, it)
@@ -303,7 +306,7 @@ def main(rank, args):
         # Periodic Video Generation and Visualization
         # =========================================================================
         if rank == 0 and it % args.eval_freq == 0 and it > 0:
-            ema.eval()
+            model.eval() 
             with torch.no_grad():
                 try:
                     b_vis = 1
@@ -312,17 +315,20 @@ def main(rank, args):
                     
                     c_feat_vis = vae_cond_model.module.extract(c_init_vis).detach()
                     
-                    unwrapped_ema = ema.module if hasattr(ema, 'module') else ema
-                    true_seq_len = unwrapped_ema.ae_emb_dim
+                    unwrapped_model = model.module if hasattr(model, 'module') else model
+                    true_seq_len = unwrapped_model.ae_emb_dim
                     
                     fm_sampler = FlowMatching(
-                        FMSamplingWrapper(ema), 
+                        FMSamplingWrapper(unwrapped_model),
                         channels=args.in_channels, 
                         image_size=true_seq_len, 
                         sampling_timesteps=50
                     ).to(device)
                     
                     z_sampled = fm_sampler.sample(batch_size=b_vis, cond=c_feat_vis)
+                    running_mean_vis = unwrapped_model.bn.running_mean.view(1, -1, 1).to(device)
+                    running_var_vis = unwrapped_model.bn.running_var.view(1, -1, 1).to(device)
+                    z_sampled = z_sampled * torch.sqrt(running_var_vis + 1e-5) + running_mean_vis
                     
                     if hasattr(vae_pred_model.module, 'decode_from_sample'):
                         pred_vis = vae_pred_model.module.decode_from_sample(z_sampled)
@@ -427,7 +433,7 @@ def parse_args(input_args=None):
     parser.add_argument("--align_model", type=str, default="VideoMAEv2", choices=["VideoMAEv2", "VideoMAE", "OminiMAE", "DINOv3", "VJEPA", "VJEPA2"])
     parser.add_argument("--align_ckpt_dir", type=str, default="./ckpts")
     
-    parser.add_argument('--vae_align_proj_coeff', type=float, default=1.0)
+    parser.add_argument('--vae_align_proj_coeff', type=float, default=0.5)
     parser.add_argument('--dit_align_proj_coeff', type=float, default=0.5)
 
     args = parser.parse_args()

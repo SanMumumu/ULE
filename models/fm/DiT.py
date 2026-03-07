@@ -139,19 +139,32 @@ class DiT(nn.Module):
             nn.Linear(hidden_size, teacher_dim)
         )
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
+        # Note that we disable affine parameters in the batch norm layer, to avoid affine hacking diffusion loss
+        self.bn = nn.BatchNorm1d(in_channels, eps=1e-4, momentum=0.1, affine=False, track_running_stats=True)
+        self.bn.reset_running_stats()
         self.initialize_weights()
-
+        
     def initialize_weights(self):
-        torch.nn.init.normal_(self.pos_embed, std=0.02)
-        torch.nn.init.normal_(self.segment_embed, std=0.02)
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
         for module in self.repa_proj.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
+
+        # Zero-out adaLN modulation layers in SiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
@@ -201,6 +214,7 @@ class DiT(nn.Module):
         return proj_loss
 
     def forward(self, x, align_target, cond=None, time_input=None, noises=None, align_only=False):
+        x = self.bn(x)
         b, device, dtype = x.shape[0], x.device, x.dtype
         
         if time_input is None:
@@ -240,7 +254,7 @@ class DiT(nn.Module):
         ])
         pred_v = pred_v + self.segment_embed[:, seg_indices, :]
         
-        t_emb = timestep_embedding(time_input, self.x_embedder.out_features)
+        t_emb = timestep_embedding(time_input * self.time_scale_factor, self.x_embedder.out_features)
         t_emb = self.t_embedder(t_emb)
         
         proj_loss = torch.tensor(0.0, device=device)
@@ -305,7 +319,7 @@ class DiT(nn.Module):
         ])
         pred_v = pred_v + self.segment_embed[:, seg_indices, :]
         
-        t_emb = timestep_embedding(time_input, self.x_embedder.out_features)
+        t_emb = timestep_embedding(time_input * self.time_scale_factor, self.x_embedder.out_features)
         t_emb = self.t_embedder(t_emb)
         
         for block in self.blocks:
@@ -314,7 +328,61 @@ class DiT(nn.Module):
         pred_v = self.final_layer(pred_v, t_emb)
         pred_v = pred_v.transpose(1, 2)
         return pred_v
-    
+
+
+#################################################################################
+#                   Sine/Cosine Positional Embedding Functions                  #
+#################################################################################
+# https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+    """
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token and extra_tokens > 0:
+        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
 
 #################################################################################
 #                                   DiT Configs                                 #

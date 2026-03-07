@@ -94,6 +94,11 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
         
         z_sampled_val = fm_sampler.sample(batch_size=b_vis, cond=c_feat_val)
         
+        running_mean = unwrapped_ema.bn.running_mean.view(1, -1, 1).to(device)
+        running_var = unwrapped_ema.bn.running_var.view(1, -1, 1).to(device)
+
+        z_sampled_val = z_sampled_val * torch.sqrt(running_var + 1e-5) + running_mean
+                
         if hasattr(vae_pred_model.module, 'decode_from_sample'):
             pred_vis_val = vae_pred_model.module.decode_from_sample(z_sampled_val)
         else:
