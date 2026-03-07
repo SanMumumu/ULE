@@ -1,7 +1,14 @@
 import torch
 import math
+import numpy as np
 import torch.nn.functional as F
 
+def calculate_fvd(videos_real, videos_fake, i3d, device):
+    embeddings_real = get_fvd_logits(videos_real, i3d, device)
+    embeddings_fake = get_fvd_logits(videos_fake, i3d, device)
+    
+    fvd = frechet_distance(embeddings_fake, embeddings_real)
+    return fvd.item()
 
 def preprocess_single(video, resolution, sequence_length=None):
     # video: THWC, {0, ..., 255}
@@ -32,12 +39,12 @@ def preprocess_single(video, resolution, sequence_length=None):
 
     return video
 
-
 def preprocess(videos, target_resolution=224):
-    # videos in {0, ..., 255} as np.uint8 array
-    videos = torch.from_numpy(videos)
+    if isinstance(videos, np.ndarray):
+        videos = torch.from_numpy(videos)
+    
     videos = torch.stack([preprocess_single(video, target_resolution) for video in videos])
-    return videos * 2  # [-0.5, 0.5] -> [-1, 1]
+    return videos * 2
 
 
 # https://github.com/tensorflow/gan/blob/de4b8da3853058ea380a6152bd3bd454013bf619/tensorflow_gan/python/eval/classifier_metrics.py#L161

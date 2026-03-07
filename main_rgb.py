@@ -373,7 +373,7 @@ def main(rank, args):
         # =========================================================================
         # Quantitative Evaluation
         # =========================================================================
-        if rank == 0 and it % args.eval_freq == 0 and it > 0:
+        if rank == 0 and it % args.eval_freq  == 0 and it > 0:
             ema.eval(); vae_cond_model.eval(); vae_pred_model.eval()
             
             run_evaluation(
@@ -416,7 +416,7 @@ def parse_args(input_args=None):
     parser.add_argument('--no_sched', action='store_true')
     parser.add_argument('--scale_lr', action='store_true')
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--samples', type=int, default=0)
+    parser.add_argument('--samples', type=int, default=1)
     parser.add_argument('--traj', type=int, default=1)
     parser.add_argument('--NFE', type=int, default=25)
     parser.add_argument('--no_depth_cond', action='store_true')

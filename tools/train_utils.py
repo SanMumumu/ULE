@@ -59,6 +59,7 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
     """
     try:
         from evals.fvd.fvd import calculate_fvd
+        from evals.fvd.download import load_i3d_pretrained
         from losses.lpips import LPIPS
         from skimage.metrics import structural_similarity as ssim_func
     except ImportError as e:
@@ -67,6 +68,7 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
 
     log_(f"🚀 Running quantitative evaluation (target samples: {args.eval_samples})...")
     
+    i3d = load_i3d_pretrained(device)
     lpips_fn = LPIPS().eval().to(device)
     all_reals, all_preds = [], []
     num_samples = 0
@@ -148,13 +150,18 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
         
         reals_uint8 = (reals_01 * 255).clamp(0, 255).to(torch.uint8).to(device)
         preds_uint8 = (preds_01 * 255).clamp(0, 255).to(torch.uint8).to(device)
+        
+        reals_fvd = reals_uint8.permute(0, 1, 3, 4, 2) 
+        preds_fvd = preds_uint8.permute(0, 1, 3, 4, 2)
+
         try:
-            fvd_val = calculate_fvd(reals_uint8, preds_uint8, device)
-            if isinstance(fvd_val, torch.Tensor): fvd_val = fvd_val.item()
+            fvd_val = calculate_fvd(reals_fvd, preds_fvd, i3d, device)
+            if isinstance(fvd_val, torch.Tensor): 
+                fvd_val = fvd_val.item()
         except Exception as e:
             log_(f"⚠️ FVD calculation failed: {str(e)}")
             fvd_val = 0.0
-            
+                
         log_(f"✅ [Eval Report Step {it}] PSNR: {psnr_val:.4f} | SSIM: {ssim_val:.4f} | LPIPS: {lpips_val:.4f} | FVD: {fvd_val:.4f}")
         
         if logger is not None:
