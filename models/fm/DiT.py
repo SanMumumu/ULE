@@ -134,10 +134,11 @@ class DiT(nn.Module):
         ])
 
         self.repa_proj = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+            nn.Conv1d(in_channels=hidden_size, out_channels=hidden_size, kernel_size=1),
             nn.GELU(),
-            nn.Linear(hidden_size, teacher_dim)
+            nn.Conv1d(in_channels=hidden_size, out_channels=teacher_dim, kernel_size=1)
         )
+        
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         # Note that we disable affine parameters in the batch norm layer, to avoid affine hacking diffusion loss
         self.bn = nn.BatchNorm1d(in_channels, eps=1e-4, momentum=0.1, affine=False, track_running_stats=True)
@@ -154,7 +155,7 @@ class DiT(nn.Module):
         self.apply(_basic_init)
 
         for module in self.repa_proj.modules():
-            if isinstance(module, nn.Linear):
+            if isinstance(module, nn.Conv1d): 
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
@@ -218,7 +219,7 @@ class DiT(nn.Module):
         b, device, dtype = x.shape[0], x.device, x.dtype
         
         if time_input is None:
-            time_input = torch.sigmoid(torch.randn((b,), device=device, dtype=dtype))
+            time_input = torch.rand((b,), device=device, dtype=dtype)
         else:
             time_input = time_input.to(device=device, dtype=dtype)
         
@@ -238,7 +239,6 @@ class DiT(nn.Module):
             pred_v = torch.cat([pred_v, cond], dim=1) 
         
         pred_v = pred_v.transpose(1, 2)
-        
         pred_v = self.x_embedder(pred_v)
         
         seq_len = pred_v.shape[1]
@@ -262,23 +262,32 @@ class DiT(nn.Module):
         for i, block in enumerate(self.blocks):
             pred_v = block(pred_v, t_emb)
             
-            if align_only and (i + 1) == self.aligned_depth:
-                student_feats = self.repa_proj(pred_v)
+            if (i + 1) == self.aligned_depth:
+                # 1. 维度转换: [B, L, C] -> [B, C, L]，以适配 Conv1d
+                student_feats_conv = pred_v.transpose(1, 2)
+                
+                # 2. 经过 1x1 卷积映射
+                student_feats_conv = self.repa_proj(student_feats_conv)
+                
+                # 3. 维度转换回原格式: [B, teacher_dim, L] -> [B, L, teacher_dim]
+                student_feats = student_feats_conv.transpose(1, 2)
                 
                 if align_target is not None:
-                    # Invoke encapsulated alignment logic
+                    # 调用原本的方法计算 loss，由于该方法内部期望的是 [B, L, teacher_dim] 的形状
                     proj_loss = self.compute_triplane_repa_loss(student_feats, align_target, device)
                 
-                return {
-                    "proj_loss": proj_loss,
-                    "time_input": time_input,
-                    "noises": noises,
-                }
+                if align_only:
+                    return {
+                        "proj_loss": proj_loss,
+                        "time_input": time_input,
+                        "noises": noises,
+                    }
                         
         pred_v = self.final_layer(pred_v, t_emb)
         pred_v = pred_v.transpose(1, 2)
         denoising_loss = self.get_loss(pred_v, target_v)
         
+        # 【核心修改点】：全量计算时，将 proj_loss 也带回，交给优化器去优化 repa_proj
         return {
             "denoising_loss": denoising_loss,
             "proj_loss": proj_loss,

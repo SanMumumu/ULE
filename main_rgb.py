@@ -236,8 +236,9 @@ def main(rank, args):
                 opt_vae_g.zero_grad(set_to_none=True)
                 opt_dit.zero_grad(set_to_none=True)
                 
+                current_decay = min(0.9999, (it + 1) / (it + 10))
                 unwrapped_model = model.module if hasattr(model, 'module') else model
-                update_ema(ema, unwrapped_model)
+                update_ema(ema, unwrapped_model, decay=current_decay)
 
         else:
             # -------------------------------------------------------------
@@ -433,8 +434,8 @@ def parse_args(input_args=None):
     parser.add_argument("--align_model", type=str, default="VideoMAEv2", choices=["VideoMAEv2", "VideoMAE", "OminiMAE", "DINOv3", "VJEPA", "VJEPA2"])
     parser.add_argument("--align_ckpt_dir", type=str, default="./ckpts")
     
-    parser.add_argument('--vae_align_proj_coeff', type=float, default=0.5)
-    parser.add_argument('--dit_align_proj_coeff', type=float, default=0.5)
+    parser.add_argument('--vae_align_proj_coeff', type=float, default=1.0)
+    parser.add_argument('--dit_align_proj_coeff', type=float, default=1.0)
 
     args = parser.parse_args()
 
