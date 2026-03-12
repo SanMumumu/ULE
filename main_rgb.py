@@ -283,7 +283,7 @@ def main(rank, args):
             if not disc_opt:
                 pbar.set_description(f"VAE: {losses['pred_vae_loss'].average:.3f} | Denoise: {losses['dit_denoise_loss'].average:.3f} | REPA:  {losses['vae_repa_loss'].average:.3f}")
             else:
-                pbar.set_description(f"Disc Loss: {losses['d_loss'].average:.3f}")
+                pbar.set_description(f"Disc Loss: {losses['disc_loss'].average:.3f}")
                 
         if it % args.log_freq == 0:
             if rank == 0 and logger is not None:

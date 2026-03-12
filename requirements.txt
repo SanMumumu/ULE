@@ -38,3 +38,4 @@ einops
 torchmetrics
 termcolor
 scikit-image
+nvitop
