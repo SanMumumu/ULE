@@ -2,7 +2,7 @@ import os
 import copy
 import yaml
 import argparse
-import contextlib # <-- 新增：用于管理 DDP 的 no_sync 上下文
+import contextlib
 import torch
 import torch.nn as nn
 import torchvision
@@ -14,9 +14,8 @@ from tools.dataloader import get_loaders
 from tools.utils import AverageMeter, setup_distibuted_training, setup_logger, set_random_seed
 
 from tools.train_utils import (
-    init_multiprocessing, update_ema, run_evaluation, save_image_grid, 
-    log_videos_e2e, set_requires_grad, get_teacher_model, get_align_targets, 
-    prepare_input, config_setup, FMSamplingWrapper
+    init_multiprocessing, update_ema, run_evaluation, save_image_grid, log_videos_e2e, 
+    set_requires_grad, get_teacher_model, get_align_targets, config_setup, FMSamplingWrapper
 )
 
 from models.vae.vae_vit_rope import ViTAutoencoder
@@ -179,9 +178,9 @@ def main(rank, args):
                         optimizer_idx=0, global_step=it // accum_iter
                     )
 
-                    _, cond = prepare_input(args, x_vae, vae_cond_model, vae_pred_model)
                     vae_loss = (vae_cond_loss + vae_pred_loss) / accum_iter
                     
+                    cond = z_cond if torch.rand(1).item() < args.cond_prob else None
                     vae_align_outputs = model.module(
                         x=z_pred, cond=cond, align_target=align_target,
                         time_input=None, noises=None, align_only=True

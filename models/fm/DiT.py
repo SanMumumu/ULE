@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
-from models.fm.utils import timestep_embedding
+from models.fm.utils import timestep_embedding, pad_triplane_cond
 
 
 class FMWrapper(nn.Module):
@@ -254,12 +254,12 @@ class DiT(nn.Module):
         
         target_v = x - noises
 
-        if cond is not None:
-            if cond.shape[2] != pred_v.shape[2]:
-                 cond = F.pad(cond, (0, pred_v.shape[2] - cond.shape[2]), "constant", 0)
-            pred_v = torch.cat([pred_v, cond], dim=1) 
-        
-        pred_v = pred_v.transpose(1, 2)
+        if cond is None:
+            cond = torch.zeros_like(pred_v)
+        else:
+            cond = self._pad_triplane_cond(cond, pred_v.shape[2])
+
+        pred_v = torch.cat([pred_v, cond], dim=1).transpose(1, 2)
         pred_v = self.x_embedder(pred_v)
         
         seq_len = pred_v.shape[1]

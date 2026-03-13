@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from einops import repeat
+import torch.nn.functional as F
 
 
 def checkpoint(func, inputs, params, flag):
@@ -130,3 +131,31 @@ def avg_pool_nd(dims, *args, **kwargs):
     elif dims == 3:
         return nn.AvgPool3d(*args, **kwargs)
     raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def pad_triplane_cond(input_size, cond, target_len):
+        b, c, current_len = cond.shape
+        
+        if current_len == target_len:
+            return cond
+            
+        len_xy = input_size * input_size
+        len_yt_cond = (current_len - len_xy) // 2
+        len_xt_cond = len_yt_cond
+        
+        len_yt_target = (target_len - len_xy) // 2
+        len_xt_target = len_yt_target
+        
+        cond_xy = cond[:, :, :len_xy]
+        cond_yt = cond[:, :, len_xy : len_xy + len_yt_cond]
+        cond_xt = cond[:, :, len_xy + len_yt_cond :]
+        
+        pad_yt_len = len_yt_target - len_yt_cond
+        pad_xt_len = len_xt_target - len_xt_cond
+        
+        cond_yt_padded = F.pad(cond_yt, (0, pad_yt_len), "constant", 0)
+        cond_xt_padded = F.pad(cond_xt, (0, pad_xt_len), "constant", 0)
+        
+        cond_aligned = torch.cat([cond_xy, cond_yt_padded, cond_xt_padded], dim=2)
+        
+        return cond_aligned

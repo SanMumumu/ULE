@@ -263,30 +263,6 @@ def get_align_targets(x_pred, teacher_model, align_model_name, patch_size=16, tu
             raise NotImplementedError()
     return align_target
 
-def prepare_input(args, x, vae_cond_model=None, vae_pred_model=None):
-    p = np.random.random()
-    if p < args.cond_prob:
-        c, x = x[:, :, :args.cond_frames], x[:, :, args.cond_frames:]
-        mask = (c + 1).contiguous().view(c.size(0), -1) ** 2
-        mask = torch.where(mask.sum(dim=-1) > 0, 1, 0).view(-1, 1, 1)
-        with torch.no_grad():
-            z = vae_pred_model.module.extract(x).detach()
-            if vae_cond_model is not None:
-                c = vae_cond_model.module.extract(c).detach()
-            else:
-                c = vae_pred_model.module.extract(c).detach()
-            c = c * mask + torch.zeros_like(c).to(c.device) * (1 - mask)
-    else:
-        c, x_tmp = x[:, :, :args.cond_frames], x[:, :, args.cond_frames:]
-        mask = (c + 1).contiguous().view(c.size(0), -1) ** 2
-        mask = torch.where(mask.sum(dim=-1) > 0, 1, 0).view(-1, 1, 1, 1, 1)
-        clip_length = x_tmp.size(2)
-        prefix = random.randint(0, args.cond_frames)
-        x = x[:, :, prefix:prefix + clip_length, :, :] * mask + x_tmp * (1 - mask)
-        with torch.no_grad():
-            z = vae_pred_model.module.extract(x).detach()
-            c = torch.zeros_like(z).to(x.device)
-    return z, c
 
 def config_setup(args):
     config = OmegaConf.load(args.vae_config)
