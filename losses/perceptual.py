@@ -101,7 +101,7 @@ class LPIPSWithDiscriminator(nn.Module):
             gan_feat_loss = disc_factor * self.gan_feat_weight * (image_gan_feat_loss + video_gan_feat_loss)
             rec_part = rec_loss + p_loss + g_loss + gan_feat_loss
             total_loss = rec_part + kl_loss
-            return total_loss, rec_part, kl_loss
+            return total_loss, rec_part, kl_loss, rec_loss
 
         if optimizer_idx == 1:
             # second pass for discriminator update

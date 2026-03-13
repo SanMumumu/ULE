@@ -11,10 +11,10 @@ vae:
     perceptual_weight: 4.0
     lossconfig:
       params:
-        disc_start: 15000
+        disc_start: 15000 # Start training the GAN from disc_start * 3 steps
   vaeconfig:
     channels: 192
-    resolution: 128  # For non-square images set a tuple [h, w] (e.g. resolution: [128, 256])
+    resolution: 128 # For non-square images set a tuple [h, w] (e.g. resolution: [128, 256])
     cond_frames: 2
     pred_frames: 8
     in_channels: 3
