@@ -257,7 +257,7 @@ class DiT(nn.Module):
         if not cond.any():
             cond = torch.zeros_like(pred_v)
         else:
-            cond = pad_triplane_cond(cond, pred_v.shape[2])
+            cond = pad_triplane_cond(self.input_size, cond, pred_v.shape[2])
         
         pred_v = pred_v.transpose(1, 2)
         pred_v = self.x_embedder(pred_v)
