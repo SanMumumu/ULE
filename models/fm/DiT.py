@@ -170,6 +170,8 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.segment_embed, std=0.02)
 
     def get_loss(self, pred, target):
         return torch.nn.functional.mse_loss(target, pred)
@@ -282,17 +284,11 @@ class DiT(nn.Module):
             pred_v = block(pred_v, t_emb)
             
             if (i + 1) == self.aligned_depth:
-                # 1. 维度转换: [B, L, C] -> [B, C, L]，以适配 Conv1d
                 student_feats_conv = pred_v.transpose(1, 2)
-                
-                # 2. 经过 1x1 卷积映射
                 student_feats_conv = self.repa_proj(student_feats_conv)
-                
-                # 3. 维度转换回原格式: [B, teacher_dim, L] -> [B, L, teacher_dim]
                 student_feats = student_feats_conv.transpose(1, 2)
                 
                 if align_target is not None:
-                    # 调用原本的方法计算 loss，由于该方法内部期望的是 [B, L, teacher_dim] 的形状
                     proj_loss = self.compute_triplane_repa_loss(student_feats, align_target, align_only, device)
                 
                 if align_only:

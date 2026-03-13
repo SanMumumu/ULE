@@ -30,7 +30,7 @@ def load_i3d_pretrained(device=torch.device('cpu')):
     from evals.fvd.pytorch_i3d import InceptionI3d
     i3d = InceptionI3d(400, in_channels=3).to(device)
     # filepath = download(_I3D_PRETRAINED_ID, 'i3d_pretrained_400.pt')
-    filepath = "/mnt/data/wangsen/SyncVP/evals/fvd/i3d_pretrained_400.pt"
+    filepath = "evals/fvd/i3d_pretrained_400.pt"
     i3d.load_state_dict(torch.load(filepath, map_location=device))
     i3d.eval()
     return i3d
