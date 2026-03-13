@@ -254,12 +254,12 @@ class DiT(nn.Module):
         
         target_v = x - noises
 
-        if cond is None:
+        if not cond.any():
             cond = torch.zeros_like(pred_v)
         else:
-            cond = self._pad_triplane_cond(cond, pred_v.shape[2])
-
-        pred_v = torch.cat([pred_v, cond], dim=1).transpose(1, 2)
+            cond = pad_triplane_cond(cond, pred_v.shape[2])
+        
+        pred_v = pred_v.transpose(1, 2)
         pred_v = self.x_embedder(pred_v)
         
         seq_len = pred_v.shape[1]

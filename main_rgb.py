@@ -178,9 +178,12 @@ def main(rank, args):
                         optimizer_idx=0, global_step=it // accum_iter
                     )
 
+                    mask = (torch.rand(batch_size, device=device) < args.cond_prob).to(z_cond.dtype)
+                    mask = mask.view(batch_size, *[1] * (z_cond.dim() - 1))
+                    cond = z_cond * mask
+                    
                     vae_loss = (vae_cond_loss + vae_pred_loss) / accum_iter
                     
-                    cond = z_cond if torch.rand(1).item() < args.cond_prob else None
                     vae_align_outputs = model.module(
                         x=z_pred, cond=cond, align_target=align_target,
                         time_input=None, noises=None, align_only=True
