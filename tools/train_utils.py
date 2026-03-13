@@ -56,6 +56,7 @@ class FMSamplingWrapper(nn.Module):
 def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device, it, logger, log_):
     """
     Quantitative evaluation on the validation set: PSNR, SSIM, LPIPS, FVD.
+    Separated for Cond frames (reconstruction) and Pred frames (generation).
     """
     try:
         from evals.fvd.fvd import calculate_fvd
@@ -70,7 +71,9 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
     
     i3d = load_i3d_pretrained(device)
     lpips_fn = LPIPS().eval().to(device)
-    all_reals, all_preds = [], []
+    
+    all_reals_cond, all_preds_cond = [], []
+    all_reals_pred, all_preds_pred = [], []
     num_samples = 0
     
     for x_val, _ in val_loader:
@@ -82,9 +85,31 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
         x_vae_val = rearrange(x_val / 127.5 - 1, 'b t c h w -> b c t h w') 
         
         x_cond_val = x_vae_val[:, :, :args.cond_frames] 
-        x_pred_val = x_vae_val[:, :, args.cond_frames : args.cond_frames + args.frames]
+        x_pred_val = x_vae_val[:, :, args.cond_frames : args.frames]
         
         c_feat_val = vae_cond_model.module.extract(x_cond_val).detach()
+        
+        # ==================== A. VAE Reconstruction ====================
+        if hasattr(vae_cond_model.module, 'decode_from_sample'):
+            pred_cond_val = vae_cond_model.module.decode_from_sample(c_feat_val)
+        else:
+            out_cond_val = vae_cond_model.module.decode(c_feat_val)
+            pred_cond_val = out_cond_val.sample if hasattr(out_cond_val, 'sample') else out_cond_val
+            
+        pred_cond_val = pred_cond_val.clamp(-1.0, 1.0)
+        
+        if pred_cond_val.dim() == 4:
+            T_cond = pred_cond_val.shape[0] // b_vis
+            pred_cond_val = pred_cond_val.view(b_vis, T_cond, pred_cond_val.shape[1], pred_cond_val.shape[2], pred_cond_val.shape[3])
+            pred_cond_val = pred_cond_val.permute(0, 2, 1, 3, 4)
+            
+        min_T_cond = min(x_cond_val.shape[2], pred_cond_val.shape[2])
+        real_vid_cond = x_cond_val[:, :, :min_T_cond, :, :].cpu().permute(0, 2, 1, 3, 4)
+        gen_vid_cond = pred_cond_val[:, :, :min_T_cond, :, :].cpu().permute(0, 2, 1, 3, 4)
+        all_reals_cond.append(real_vid_cond)
+        all_preds_cond.append(gen_vid_cond)
+
+        # ==================== B. DiT/FM Generation ====================
         unwrapped_ema = ema.module if hasattr(ema, 'module') else ema
         true_seq_len = unwrapped_ema.ae_emb_dim
         
@@ -96,7 +121,6 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
         
         running_mean = unwrapped_ema.bn.running_mean.view(1, -1, 1).to(device)
         running_var = unwrapped_ema.bn.running_var.view(1, -1, 1).to(device)
-
         z_sampled_val = z_sampled_val * torch.sqrt(running_var + 1e-5) + running_mean
                 
         if hasattr(vae_pred_model.module, 'decode_from_sample'):
@@ -112,24 +136,44 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
             pred_vis_val = pred_vis_val.view(b_vis, T_pred, pred_vis_val.shape[1], pred_vis_val.shape[2], pred_vis_val.shape[3])
             pred_vis_val = pred_vis_val.permute(0, 2, 1, 3, 4)
             
-        min_T = min(x_pred_val.shape[2], pred_vis_val.shape[2])
-        real_vid = x_pred_val[:, :, :min_T, :, :].cpu().permute(0, 2, 1, 3, 4)
-        gen_vid = pred_vis_val[:, :, :min_T, :, :].cpu().permute(0, 2, 1, 3, 4)
+        min_T_pred = min(x_pred_val.shape[2], pred_vis_val.shape[2])
+        real_vid_pred = x_pred_val[:, :, :min_T_pred, :, :].cpu().permute(0, 2, 1, 3, 4)
+        gen_vid_pred = pred_vis_val[:, :, :min_T_pred, :, :].cpu().permute(0, 2, 1, 3, 4)
+        all_reals_pred.append(real_vid_pred)
+        all_preds_pred.append(gen_vid_pred)
         
-        all_reals.append(real_vid)
-        all_preds.append(gen_vid)
         num_samples += b_vis
 
-    if len(all_reals) == 0: return
+    if len(all_reals_pred) == 0: return
 
-    reals_btchw = torch.cat(all_reals, dim=0)[:args.eval_samples]
-    preds_btchw = torch.cat(all_preds, dim=0)[:args.eval_samples]
-    
-    reals_01 = (reals_btchw + 1.0) / 2.0
-    preds_01 = (preds_btchw + 1.0) / 2.0
-    
     try:
-        psnr_val = compute_psnr(reals_01, preds_01)
+        c_psnr, c_ssim, c_lpips, c_fvd = _calculate_metrics_for_split(all_reals_cond, all_preds_cond)
+        log_(f"✅ [Eval Cond Reconstruct Step {it}] PSNR: {c_psnr:.4f} | SSIM: {c_ssim:.4f} | LPIPS: {c_lpips:.4f} | FVD: {c_fvd:.4f}")
+
+        p_psnr, p_ssim, p_lpips, p_fvd = _calculate_metrics_for_split(all_reals_pred, all_preds_pred)
+        log_(f"✅ [Eval Pred Generation Step {it}] PSNR: {p_psnr:.4f} | SSIM: {p_ssim:.4f} | LPIPS: {p_lpips:.4f} | FVD: {p_fvd:.4f}")
+        
+        if logger is not None:
+            logger.scalar_summary('eval_pred/psnr', p_psnr, it)
+            logger.scalar_summary('eval_pred/ssim', p_ssim, it)
+            logger.scalar_summary('eval_pred/lpips', p_lpips, it)
+            logger.scalar_summary('eval_pred/fvd', p_fvd, it)
+            
+    except Exception as e:
+        log_(f"❌ Evaluation process exception: {str(e)}")
+        
+    finally:
+        del lpips_fn
+        torch.cuda.empty_cache()
+
+    def _calculate_metrics_for_split(reals_list, preds_list):
+        reals_btchw = torch.cat(reals_list, dim=0)[:args.eval_samples]
+        preds_btchw = torch.cat(preds_list, dim=0)[:args.eval_samples]
+        
+        reals_01 = (reals_btchw + 1.0) / 2.0
+        preds_01 = (preds_btchw + 1.0) / 2.0
+        
+        psnr_v = compute_psnr(reals_01, preds_01)
         
         reals_np = reals_01.numpy()
         preds_np = preds_01.numpy()
@@ -140,7 +184,7 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
                 img1 = np.transpose(reals_np[b, t], (1, 2, 0)) 
                 img2 = np.transpose(preds_np[b, t], (1, 2, 0))
                 ssim_sum += ssim_func(img1, img2, data_range=1.0, channel_axis=-1)
-        ssim_val = ssim_sum / (B * T)
+        ssim_v = ssim_sum / (B * T)
         
         reals_11 = reals_01 * 2 - 1
         preds_11 = preds_01 * 2 - 1
@@ -150,8 +194,7 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
             p_f = preds_11[b].to(device)
             with torch.no_grad():
                 lpips_sum += lpips_fn(r_f, p_f).mean().item()
-        lpips_val = lpips_sum / B
-        del lpips_fn
+        lpips_v = lpips_sum / B
         
         reals_uint8 = (reals_01 * 255).clamp(0, 255).to(torch.uint8).to(device)
         preds_uint8 = (preds_01 * 255).clamp(0, 255).to(torch.uint8).to(device)
@@ -160,48 +203,15 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
         preds_fvd = preds_uint8.permute(0, 1, 3, 4, 2)
 
         try:
-            fvd_val = calculate_fvd(reals_fvd, preds_fvd, i3d, device)
-            if isinstance(fvd_val, torch.Tensor): 
-                fvd_val = fvd_val.item()
+            fvd_v = calculate_fvd(reals_fvd, preds_fvd, i3d, device)
+            if isinstance(fvd_v, torch.Tensor): 
+                fvd_v = fvd_v.item()
         except Exception as e:
             log_(f"⚠️ FVD calculation failed: {str(e)}")
-            fvd_val = 0.0
-                
-        log_(f"✅ [Eval Report Step {it}] PSNR: {psnr_val:.4f} | SSIM: {ssim_val:.4f} | LPIPS: {lpips_val:.4f} | FVD: {fvd_val:.4f}")
-        
-        if logger is not None:
-            logger.scalar_summary('eval/psnr', psnr_val, it)
-            logger.scalar_summary('eval/ssim', ssim_val, it)
-            logger.scalar_summary('eval/lpips', lpips_val, it)
-            logger.scalar_summary('eval/fvd', fvd_val, it)
-    except Exception as e:
-        log_(f"❌ Evaluation process exception: {str(e)}")
-    finally:
-        torch.cuda.empty_cache()
+            fvd_v = 0.0
+            
+        return psnr_v, ssim_v, lpips_v, fvd_v
 
-def save_image_grid(img, fname, drange, grid_size=None, normalize=True):
-    from PIL import Image
-    if normalize:
-        lo, hi = drange
-        img = np.asarray(img, dtype=np.float32)
-        img = (img - lo) * (255 / (hi - lo))
-        img = np.rint(img).clip(0, 255).astype(np.uint8)
-
-    B, C, T, H, W = img.shape
-    img = img.transpose(0, 3, 2, 4, 1) 
-    img = img.reshape(B * H, T * W, C)
-    if C == 1: img = np.repeat(img, 3, axis=2)
-
-    result_img = Image.fromarray(img, 'RGB')
-    result_img.save(fname, quality=95)
-
-def log_videos_e2e(gts, predictions, it, save_dir):
-    gts_np = gts.detach().cpu().numpy()
-    preds_np = predictions.detach().cpu().numpy()
-    combined = np.stack([gts_np, preds_np], axis=1)
-    combined = combined.reshape(-1, *gts_np.shape[1:])
-    save_path = os.path.join(save_dir, f'vis_e2e_{it:07d}.png')
-    save_image_grid(combined, save_path, drange=[-1, 1])
 
 def set_requires_grad(model, requires_grad):
     for param in model.parameters():

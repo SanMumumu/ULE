@@ -14,8 +14,8 @@ from tools.dataloader import get_loaders
 from tools.utils import AverageMeter, setup_distibuted_training, setup_logger, set_random_seed
 
 from tools.train_utils import (
-    init_multiprocessing, update_ema, run_evaluation, save_image_grid, log_videos_e2e, 
-    set_requires_grad, get_teacher_model, get_align_targets, config_setup, FMSamplingWrapper
+    init_multiprocessing, update_ema, run_evaluation, set_requires_grad, 
+    get_teacher_model, get_align_targets, config_setup, FMSamplingWrapper
 )
 
 from models.vae.vae_vit_rope import ViTAutoencoder
@@ -216,12 +216,6 @@ def main(rank, args):
                 
                 z_pred_detached = z_pred.detach()
                 cond_detached = cond.detach()
-                
-                # # ===== CFG Dropout =====
-                # cfg_prob = 0.1
-                # mask = (torch.rand(batch_size, device=device) > cfg_prob).to(cond_detached.dtype)
-                # mask = mask.view(batch_size, *[1] * (cond_detached.dim() - 1))
-                # cond_detached = cond_detached * mask
             
                 with torch.autocast(device_type='cuda', enabled=args.amp):
                     sit_outputs = model(
@@ -465,7 +459,7 @@ def parse_args(input_args=None):
     parser.add_argument('--data_folder', type=str, default='/mnt/nodestor/ws/UniWM/DATA/data')
 
     # VAE Args
-    parser.add_argument('--vae_config', type=str, default='configs/test.yaml')
+    parser.add_argument('--vae_config', type=str, default='configs/model.yaml')
 
     # DiT Args
     parser.add_argument("--model", type=str, default="DiT-S", choices=DiT_models.keys(), help="The model to train.")
