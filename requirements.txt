@@ -14,7 +14,7 @@ scikit-learn
 
 # Acceleration & Optimization
 accelerate
-flash-attn>=2.0.0  # Note: Use MAX_JOBS=256 and --no-build-isolation when installing
+flash-attn>=2.8.3  # Note: Use MAX_JOBS=256 and --no-build-isolation when installing
 
 # Vision & Image Processing
 opencv-python
@@ -39,3 +39,4 @@ torchmetrics
 termcolor
 scikit-image
 nvitop
+timm

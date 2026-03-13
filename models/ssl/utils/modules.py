@@ -37,45 +37,41 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        num_heads=8,
-        qkv_bias=False,
-        qk_scale=None,
-        attn_drop=0.,
-        proj_drop=0.,
-        use_sdpa=True
-    ):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., use_sdpa=True):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.attn_drop_prob = attn_drop 
         self.proj = nn.Linear(dim, dim)
-        self.proj_drop_prob = proj_drop
         self.proj_drop = nn.Dropout(proj_drop)
         self.use_sdpa = use_sdpa
 
     def forward(self, x, mask=None):
         B, N, C = x.shape
+        # [B, N, 3, H, D] -> [3, B, H, N, D]
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.proj_drop_prob)
-                attn = None
+            x = F.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=mask, 
+                dropout_p=self.attn_drop_prob if self.training else 0.0,
+                is_causal=False 
+            )
         else:
-            attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, D, D]
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            if mask is not None:
+                attn = attn.masked_fill(mask == 0, float('-inf'))
             attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
+            attn = nn.functional.dropout(attn, p=self.attn_drop_prob, training=self.training)
             x = (attn @ v)
+
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        # return x, attn
         return x
 
 
@@ -128,6 +124,8 @@ class CrossAttention(nn.Module):
         dim,
         num_heads=12,
         qkv_bias=False,
+        attn_drop=0.,
+        proj_drop=0.,
         use_sdpa=True
     ):
         super().__init__()
@@ -135,29 +133,39 @@ class CrossAttention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, int(dim*2), bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop_prob = attn_drop
         self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
         self.use_sdpa = use_sdpa
 
     def forward(self, q, x):
+        # q: (B, n, C) -> Query
+        # x: (B, N, C) -> Key & Value (Context)
         B, n, C = q.shape
-        q = self.q(q).reshape(B, n, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        _, N, _ = x.shape
 
-        B, N, C = x.shape
+        q = self.q(q).reshape(B, n, self.num_heads, C // self.num_heads).transpose(1, 2)
+        
         kv = self.kv(x).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]  # (batch_size, num_heads, seq_len, feature_dim_per_head)
+        k, v = kv[0], kv[1] # (B, num_heads, N, head_dim)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                q = F.scaled_dot_product_attention(q, k, v)
+            q = F.scaled_dot_product_attention(
+                q, k, v, 
+                dropout_p=self.attn_drop_prob if self.training else 0.0,
+                is_causal=False
+            )
         else:
             xattn = (q @ k.transpose(-2, -1)) * self.scale
-            xattn = xattn.softmax(dim=-1)  # (batch_size, num_heads, query_len, seq_len)
+            xattn = xattn.softmax(dim=-1)
+            xattn = nn.functional.dropout(xattn, p=self.attn_drop_prob, training=self.training)
             q = (xattn @ v)
 
         q = q.transpose(1, 2).reshape(B, n, C)
+        q = self.proj(q)
+        q = self.proj_drop(q)
         return q
-
 
 class CrossAttentionBlock(nn.Module):
     def __init__(

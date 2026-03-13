@@ -174,7 +174,7 @@ class DiT(nn.Module):
     def get_loss(self, pred, target):
         return torch.nn.functional.mse_loss(target, pred)
 
-    def compute_triplane_repa_loss(self, student_feats, align_target, device):
+    def compute_triplane_repa_loss(self, student_feats, align_target, align_only, device, margin_vae=0.5, margin_dit=0.1):
         """
         Projects triplane features to 3D voxel space using grid sampling 
         and computes the cosine similarity against the teacher's target features.
@@ -206,13 +206,32 @@ class DiT(nn.Module):
         # 5. Fuse sampled points and compute cosine similarity loss
         student_feats_aligned = (feat_xy + feat_yt + feat_xt).transpose(1, 2)
         
+        # ==========================================
+        # [CRITICAL] Detach teacher features to prevent gradient leakage
+        # ==========================================
+        align_target = align_target.detach()
+        
         teacher_feats_norm = F.normalize(align_target, dim=-1)
         student_feats_norm = F.normalize(student_feats_aligned, dim=-1)
         
-        # loss ∈ [0.0, 2.0] lower means better
-        proj_loss = 1.0 - (teacher_feats_norm * student_feats_norm).sum(dim=-1).mean()
+        if align_only: # loss ∈ [0.0, 2.0] lower means better
+            # Hard Alignment for VAE training (Cosine Similarity)
+            # proj_loss = 1.0 - (teacher_feats_norm * student_feats_norm).sum(dim=-1).mean()
+            cos_sim = (teacher_feats_norm * student_feats_norm).sum(dim=-1)
+            proj_loss = F.relu(1.0 - margin_vae - cos_sim).mean()
+            return proj_loss
+        else: 
+            # Calculate Pairwise Relation Matrices
+            # [B, N, C] @ [B, C, N] -> [B, N, N]
+            student_sim = torch.bmm(student_feats_norm, student_feats_norm.transpose(1, 2))
+            teacher_sim = torch.bmm(teacher_feats_norm, teacher_feats_norm.transpose(1, 2))
+            
+            # Compute TRD loss with Margin (Relaxed Constraint)
+            # This allows the generative model to retain diversity if error is within 'margin'
+            trd_loss = F.relu((student_sim - teacher_sim).abs() - margin_dit).mean()
+            
+        return trd_loss
         
-        return proj_loss
 
     def forward(self, x, align_target, cond=None, time_input=None, noises=None, align_only=False):
         x = self.bn(x)
@@ -274,11 +293,11 @@ class DiT(nn.Module):
                 
                 if align_target is not None:
                     # 调用原本的方法计算 loss，由于该方法内部期望的是 [B, L, teacher_dim] 的形状
-                    proj_loss = self.compute_triplane_repa_loss(student_feats, align_target, device)
+                    proj_loss = self.compute_triplane_repa_loss(student_feats, align_target, align_only, device)
                 
                 if align_only:
                     return {
-                        "proj_loss": proj_loss,
+                        "align_vae_loss": proj_loss,
                         "time_input": time_input,
                         "noises": noises,
                     }
@@ -290,7 +309,7 @@ class DiT(nn.Module):
         # 【核心修改点】：全量计算时，将 proj_loss 也带回，交给优化器去优化 repa_proj
         return {
             "denoising_loss": denoising_loss,
-            "proj_loss": proj_loss,
+            "align_dit_loss": proj_loss,
             "time_input": time_input,
             "noises": noises,
         }

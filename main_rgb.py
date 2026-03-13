@@ -104,9 +104,9 @@ def main(rank, args):
     losses = dict()
     losses['cond_vae_loss'] = AverageMeter()
     losses['pred_vae_loss'] = AverageMeter()
-    losses['vae_repa_loss'] = AverageMeter()
+    losses['repa_vae_loss'] = AverageMeter()
     losses['dit_denoise_loss'] = AverageMeter()
-    losses['dit_repa_loss'] = AverageMeter()
+    losses['repa_dit_loss'] = AverageMeter()
     losses['disc_loss'] = AverageMeter()
     losses['vae_cond_recon'] = AverageMeter()
     losses['vae_pred_recon'] = AverageMeter()
@@ -172,7 +172,7 @@ def main(rank, args):
                     time_input=None, noises=None, align_only=True
                 )
 
-                vae_repa_val = vae_align_outputs["proj_loss"].mean()
+                vae_repa_val = vae_align_outputs["align_vae_loss"].mean()
                 vae_loss = vae_loss + (args.vae_align_proj_coeff * vae_repa_val / accum_iter)
                 
                 time_input = vae_align_outputs["time_input"]
@@ -183,7 +183,7 @@ def main(rank, args):
 
             losses['cond_vae_loss'].update(vae_cond_loss.item(), 1)
             losses['pred_vae_loss'].update(vae_pred_loss.item(), 1)
-            losses['vae_repa_loss'].update(vae_repa_val.item(), 1)
+            losses['repa_vae_loss'].update(vae_repa_val.item(), 1)
             losses['vae_cond_recon'].update(cond_recon_loss.item(), 1)
             losses['vae_pred_recon'].update(pred_recon_loss.item(), 1)
 
@@ -205,7 +205,7 @@ def main(rank, args):
                 )
                 
                 dit_denoise_val = sit_outputs["denoising_loss"].mean()
-                dit_repa_val = sit_outputs["proj_loss"].mean()
+                dit_repa_val = sit_outputs["align_dit_loss"].mean()
                 
                 dit_loss = (dit_denoise_val + args.dit_align_proj_coeff * dit_repa_val) / accum_iter
                 
@@ -213,7 +213,7 @@ def main(rank, args):
             else: dit_loss.backward()
 
             losses['dit_denoise_loss'].update(dit_denoise_val.item(), 1)
-            losses['dit_repa_loss'].update(dit_repa_val.item(), 1)
+            losses['repa_dit_loss'].update(dit_repa_val.item(), 1)
 
             if it % accum_iter == accum_iter - 1:
                 if args.amp:
@@ -281,7 +281,7 @@ def main(rank, args):
         # =========================================================================
         if rank == 0 and it % 10 == 0:
             if not disc_opt:
-                pbar.set_description(f"VAE: {losses['pred_vae_loss'].average:.3f} | Denoise: {losses['dit_denoise_loss'].average:.3f} | REPA:  {losses['vae_repa_loss'].average:.3f}")
+                pbar.set_description(f"VAE: {losses['pred_vae_loss'].average:.3f} | Denoise: {losses['dit_denoise_loss'].average:.3f} | REPA:  {losses['repa_vae_loss'].average:.3f}")
             else:
                 pbar.set_description(f"Disc Loss: {losses['disc_loss'].average:.3f}")
                 
@@ -289,9 +289,9 @@ def main(rank, args):
             if rank == 0 and logger is not None:
                 logger.scalar_summary('loss/cond_vae_loss', losses['cond_vae_loss'].average, it)
                 logger.scalar_summary('loss/pred_vae_loss', losses['pred_vae_loss'].average, it)
-                logger.scalar_summary('loss/vae_repa_loss', losses['vae_repa_loss'].average, it)
+                logger.scalar_summary('loss/repa_vae_loss', losses['repa_vae_loss'].average, it)
                 logger.scalar_summary('loss/dit_denoise_loss', losses['dit_denoise_loss'].average, it)
-                logger.scalar_summary('loss/dit_repa_loss', losses['dit_repa_loss'].average, it)
+                logger.scalar_summary('loss/repa_dit_loss', losses['repa_dit_loss'].average, it)
                 logger.scalar_summary('loss/disc_loss', losses['disc_loss'].average, it)
                 
                 logger.scalar_summary('lr/lr_vae', scheduler_vae.get_lr()[0], it)
