@@ -11,7 +11,7 @@ vae:
     perceptual_weight: 4.0
     lossconfig:
       params:
-        disc_start: 15000 # Start training the GAN from disc_start * 3 steps
+        disc_start: 1500000 # Start training the GAN from disc_start * 3 steps
   vaeconfig:
     channels: 192
     resolution: 128 # For non-square images set a tuple [h, w] (e.g. resolution: [128, 256])
@@ -28,7 +28,7 @@ model:
   eval_samples : 4
   log_freq: 5000
   resume: False
-  max_iter: 200000
+  max_iter: 250000
   params:
     linear_start: 0.0015
     linear_end: 0.0195

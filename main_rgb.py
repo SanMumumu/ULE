@@ -145,55 +145,67 @@ def main(rank, args):
 
         is_sync_step = (it % accum_iter == accum_iter - 1)
 
+        # =====================================================================
+        # CURRICULUM CORE LOGIC: Check if we enter Stage 3 (DiT-only sprint)
+        # =====================================================================
+        # Safely fallback to max_iter if vae_max_iter is not defined in args
+        vae_max_iter = getattr(args, 'vae_max_iter', args.max_iter)
+        is_stage3 = (it >= vae_max_iter)
+        
+        if is_stage3:
+            # Force disable discriminator alternation during Stage 3
+            disc_opt = False 
+
         if not disc_opt:
-            # -------------------------------------------------------------
-            # Stage 1: Dual VAE Generator + REPA
-            # -------------------------------------------------------------
-            set_requires_grad(vae_pred_model, True)
-            set_requires_grad(vae_cond_model, True)
-            set_requires_grad(model, False) 
-            model.eval() 
-            
-            sync_context_g = contextlib.ExitStack()
-            if not is_sync_step:
-                sync_context_g.enter_context(vae_pred_model.no_sync())
-                sync_context_g.enter_context(vae_cond_model.no_sync())
-                sync_context_g.enter_context(model.no_sync())
-            
-            with sync_context_g:
-                with torch.autocast(device_type='cuda', enabled=args.amp):
-                    align_target = get_align_targets(x_pred, teacher_model, args.align_model)
+            if not is_stage3:
+                # -------------------------------------------------------------
+                # Stage 1: Dual VAE Generator + REPA (E2E Phase)
+                # -------------------------------------------------------------
+                set_requires_grad(vae_pred_model, True)
+                set_requires_grad(vae_cond_model, True)
+                set_requires_grad(model, False) 
+                model.eval() 
+                
+                sync_context_g = contextlib.ExitStack()
+                if not is_sync_step:
+                    sync_context_g.enter_context(vae_pred_model.no_sync())
+                    sync_context_g.enter_context(vae_cond_model.no_sync())
+                    # Note: We safely removed model.no_sync() here because it's handled in Stage 2
+                
+                with sync_context_g:
+                    with torch.autocast(device_type='cuda', enabled=args.amp):
+                        align_target = get_align_targets(x_pred, teacher_model, args.align_model)
 
-                    x_cond_hat, kl_loss_cond = vae_cond_model(x_cond)
-                    z_cond = vae_cond_model.module.extract(x_cond)
-                    vae_cond_loss, _, cond_kl_loss, cond_l1_recon = vae_cond_criterion(
-                        kl_loss_cond, x_cond, rearrange(x_cond_hat, '(b t) c h w -> b c t h w', b=batch_size),
-                        optimizer_idx=0, global_step=it // accum_iter
-                    )
-                    
-                    x_traget_hat, kl_loss_pred = vae_pred_model(x_pred)
-                    z_pred = vae_pred_model.module.extract(x_pred)
-                    vae_pred_loss, _, pred_kl_loss, pred_l1_recon = vae_pred_criterion(
-                        kl_loss_pred, x_pred, rearrange(x_traget_hat, '(b t) c h w -> b c t h w', b=batch_size),
-                        optimizer_idx=0, global_step=it // accum_iter
-                    )
+                        x_cond_hat, kl_loss_cond = vae_cond_model(x_cond)
+                        z_cond = vae_cond_model.module.extract(x_cond)
+                        vae_cond_loss, _, cond_kl_loss, cond_l1_recon = vae_cond_criterion(
+                            kl_loss_cond, x_cond, rearrange(x_cond_hat, '(b t) c h w -> b c t h w', b=batch_size),
+                            optimizer_idx=0, global_step=it // accum_iter
+                        )
+                        
+                        x_traget_hat, kl_loss_pred = vae_pred_model(x_pred)
+                        z_pred = vae_pred_model.module.extract(x_pred)
+                        vae_pred_loss, _, pred_kl_loss, pred_l1_recon = vae_pred_criterion(
+                            kl_loss_pred, x_pred, rearrange(x_traget_hat, '(b t) c h w -> b c t h w', b=batch_size),
+                            optimizer_idx=0, global_step=it // accum_iter
+                        )
 
-                    mask = (torch.rand(batch_size, device=device) < args.cond_prob).to(z_cond.dtype)
-                    mask = mask.view(batch_size, *[1] * (z_cond.dim() - 1))
-                    cond = z_cond * mask
-                    
-                    vae_loss = (vae_cond_loss + vae_pred_loss) / accum_iter
-                    
-                    vae_align_outputs = model.module(
-                        x=z_pred, cond=cond, align_target=align_target,
-                        time_input=None, noises=None, align_only=True
-                    )
+                        mask = (torch.rand(batch_size, device=device) < args.cond_prob).to(z_cond.dtype)
+                        mask = mask.view(batch_size, *[1] * (z_cond.dim() - 1))
+                        cond = z_cond * mask
+                        
+                        vae_loss = (vae_cond_loss + vae_pred_loss) / accum_iter
+                        
+                        vae_align_outputs = model.module(
+                            x=z_pred, cond=cond, align_target=align_target,
+                            time_input=None, noises=None, align_only=True
+                        )
 
-                    vae_repa_val = vae_align_outputs["align_vae_loss"].mean()
-                    vae_loss = vae_loss + (args.vae_align_proj_coeff * vae_repa_val / accum_iter)
-                    
-                    time_input = vae_align_outputs["time_input"]
-                    noises = vae_align_outputs["noises"]
+                        vae_repa_val = vae_align_outputs["align_vae_loss"].mean()
+                        vae_loss = vae_loss + (args.vae_align_proj_coeff * vae_repa_val / accum_iter)
+                        
+                        time_input = vae_align_outputs["time_input"]
+                        noises = vae_align_outputs["noises"]
 
                 if args.amp: scaler_g.scale(vae_loss).backward()
                 else: vae_loss.backward()
@@ -205,18 +217,47 @@ def main(rank, args):
                 losses['vae_pred_recon'].update(pred_l1_recon.item(), 1)
                 losses['vae_cond_kl'].update(cond_kl_loss.item(), 1)
                 losses['vae_pred_kl'].update(pred_kl_loss.item(), 1)
-
-                # -------------------------------------------------------------
-                # Stage 2: DiT Flow Matching
-                # -------------------------------------------------------------
-                set_requires_grad(vae_pred_model, False) 
-                set_requires_grad(vae_cond_model, False)
-                set_requires_grad(model, True)
-                model.train()
                 
-                z_pred_detached = z_pred.detach()
-                cond_detached = cond.detach()
+            else:
+                # -------------------------------------------------------------
+                # Stage 3 Feature Extraction: Freeze VAE, Ultra-Fast Latent Gen
+                # -------------------------------------------------------------
+                set_requires_grad(vae_pred_model, False)
+                set_requires_grad(vae_cond_model, False)
+                vae_pred_model.eval()
+                vae_cond_model.eval()
+                
+                with torch.no_grad():
+                    with torch.autocast(device_type='cuda', enabled=args.amp):
+                        align_target = get_align_targets(x_pred, teacher_model, args.align_model)
+                        
+                        z_cond = vae_cond_model.module.extract(x_cond)
+                        z_pred = vae_pred_model.module.extract(x_pred)
+                        
+                        mask = (torch.rand(batch_size, device=device) < args.cond_prob).to(z_cond.dtype)
+                        mask = mask.view(batch_size, *[1] * (z_cond.dim() - 1))
+                        cond = z_cond * mask
+                        
+                        time_input = None
+                        noises = None
+
+            # -------------------------------------------------------------
+            # Stage 2: DiT Flow Matching (Always Active in both Stage 1 & 3)
+            # -------------------------------------------------------------
+            set_requires_grad(vae_pred_model, False) 
+            set_requires_grad(vae_cond_model, False)
+            set_requires_grad(model, True)
+            model.train()
             
+            z_pred_detached = z_pred.detach()
+            cond_detached = cond.detach()
+        
+            # Independent context stack for DDP model gradient sync
+            sync_context_fm = contextlib.ExitStack()
+            if not is_sync_step:
+                sync_context_fm.enter_context(model.no_sync())
+                
+            with sync_context_fm:
                 with torch.autocast(device_type='cuda', enabled=args.amp):
                     sit_outputs = model(
                         x=z_pred_detached, cond=cond_detached, align_target=align_target,
@@ -231,39 +272,45 @@ def main(rank, args):
                 if args.amp: scaler_fm.scale(dit_loss).backward()
                 else: dit_loss.backward()
 
-                losses['dit_denoise_loss'].update(dit_denoise_val.item(), 1)
-                losses['repa_dit_loss'].update(dit_repa_val.item(), 1)
+            losses['dit_denoise_loss'].update(dit_denoise_val.item(), 1)
+            losses['repa_dit_loss'].update(dit_repa_val.item(), 1)
 
+            # -------------------------------------------------------------
+            # Optimizer Step (Intelligently bypass VAE update in Stage 3)
+            # -------------------------------------------------------------
             if is_sync_step:
                 if args.amp:
-                    scale_before_g = scaler_g.get_scale()
+                    if not is_stage3:
+                        scale_before_g = scaler_g.get_scale()
+                        scaler_g.unscale_(opt_vae_g)
+                        torch.nn.utils.clip_grad_norm_(vae_pred_model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(vae_cond_model.parameters(), max_norm=1.0)
+                        
                     scale_before_fm = scaler_fm.get_scale()
-                    
-                    scaler_g.unscale_(opt_vae_g)
                     scaler_fm.unscale_(opt_dit)
-                    
-                    torch.nn.utils.clip_grad_norm_(vae_pred_model.parameters(), max_norm=1.0)
-                    torch.nn.utils.clip_grad_norm_(vae_cond_model.parameters(), max_norm=1.0)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     
-                    scaler_g.step(opt_vae_g)
-                    scaler_g.update()
+                    if not is_stage3:
+                        scaler_g.step(opt_vae_g)
+                        scaler_g.update()
+                        if scaler_g.get_scale() >= scale_before_g: scheduler_vae.step()
+                        
                     scaler_fm.step(opt_dit)
                     scaler_fm.update()
-                    
-                    if scaler_g.get_scale() >= scale_before_g: scheduler_vae.step()
                     if scaler_fm.get_scale() >= scale_before_fm: scheduler_dit.step()
                 else:
-                    torch.nn.utils.clip_grad_norm_(vae_pred_model.parameters(), max_norm=1.0)
-                    torch.nn.utils.clip_grad_norm_(vae_cond_model.parameters(), max_norm=1.0)
+                    if not is_stage3:
+                        torch.nn.utils.clip_grad_norm_(vae_pred_model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(vae_cond_model.parameters(), max_norm=1.0)
+                        opt_vae_g.step()
+                        scheduler_vae.step()
+                        
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                    opt_vae_g.step()
                     opt_dit.step()
-                    scheduler_vae.step()
                     scheduler_dit.step()
                     
-                opt_vae_g.zero_grad(set_to_none=True)
+                if not is_stage3:
+                    opt_vae_g.zero_grad(set_to_none=True)
                 opt_dit.zero_grad(set_to_none=True)
                 
                 current_decay = min(0.9999, (it + 1) / (it + 10))
@@ -272,7 +319,7 @@ def main(rank, args):
 
         else:
             # -------------------------------------------------------------
-            # Stage 3: Discriminator Training
+            # Stage 3 original GAN step (Fully bypassed if is_stage3 is True)
             # -------------------------------------------------------------
             if it % accum_iter == 0: 
                 vae_pred_criterion.zero_grad(set_to_none=True)
@@ -320,14 +367,17 @@ def main(rank, args):
 
             losses['disc_loss'].update(d_loss_total.item() * accum_iter, 1)
             
-        if is_sync_step and it // accum_iter >= disc_start:
+        # Only switch to Discriminator turn if we are NOT in the Stage 3 purely frozen phase
+        if is_sync_step and it // accum_iter >= disc_start and not is_stage3:
             disc_opt = not disc_opt
 
         # =========================================================================
         # TensorBoard & Tqdm Updates
         # =========================================================================
         if rank == 0 and it % 10 == 0:
-            if not disc_opt:
+            if is_stage3:
+                pbar.set_description(f"[Stage 3] DiT Denoise: {losses['dit_denoise_loss'].average:.3f} | REPA: {losses['repa_dit_loss'].average:.3f}")
+            elif not disc_opt:
                 pbar.set_description(f"VAE: {losses['pred_vae_loss'].average:.3f} | Denoise: {losses['dit_denoise_loss'].average:.3f} | REPA: {losses['repa_vae_loss'].average:.3f}")
             else:
                 pbar.set_description(f"Disc Loss: {losses['disc_loss'].average:.3f}")

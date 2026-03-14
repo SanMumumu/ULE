@@ -296,6 +296,7 @@ def config_setup(args):
     args.bn_momentum = config.model.sit_config.bn_momentum
     args.lr = config.model.base_learning_rate if 'base_learning_rate' in config.model else 1e-4
     args.max_iter = config.model.max_iter
+    args.vae_max_iter = config.vae.max_iter
     args.log_freq = config.model.log_freq
     args.eval_freq = config.model.eval_freq
     args.max_size = config.model.max_size if 'max_size' in config.model else None
