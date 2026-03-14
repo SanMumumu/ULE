@@ -144,27 +144,6 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
         
         num_samples += b_vis
 
-    if len(all_reals_pred) == 0: return
-
-    try:
-        c_psnr, c_ssim, c_lpips, c_fvd = _calculate_metrics_for_split(all_reals_cond, all_preds_cond)
-        log_(f"✅ [Eval Cond Reconstruct Step {it}] PSNR: {c_psnr:.4f} | SSIM: {c_ssim:.4f} | LPIPS: {c_lpips:.4f} | FVD: {c_fvd:.4f}")
-
-        p_psnr, p_ssim, p_lpips, p_fvd = _calculate_metrics_for_split(all_reals_pred, all_preds_pred)
-        log_(f"✅ [Eval Pred Generation Step {it}] PSNR: {p_psnr:.4f} | SSIM: {p_ssim:.4f} | LPIPS: {p_lpips:.4f} | FVD: {p_fvd:.4f}")
-        
-        if logger is not None:
-            logger.scalar_summary('eval_pred/psnr', p_psnr, it)
-            logger.scalar_summary('eval_pred/ssim', p_ssim, it)
-            logger.scalar_summary('eval_pred/lpips', p_lpips, it)
-            logger.scalar_summary('eval_pred/fvd', p_fvd, it)
-            
-    except Exception as e:
-        log_(f"❌ Evaluation process exception: {str(e)}")
-        
-    finally:
-        del lpips_fn
-        torch.cuda.empty_cache()
 
     def _calculate_metrics_for_split(reals_list, preds_list):
         reals_btchw = torch.cat(reals_list, dim=0)[:args.eval_samples]
@@ -211,6 +190,28 @@ def run_evaluation(val_loader, ema, vae_cond_model, vae_pred_model, args, device
             fvd_v = 0.0
             
         return psnr_v, ssim_v, lpips_v, fvd_v
+
+    if len(all_reals_pred) == 0: return
+
+    try:
+        c_psnr, c_ssim, c_lpips, c_fvd = _calculate_metrics_for_split(all_reals_cond, all_preds_cond)
+        log_(f"✅ [Eval Cond Reconstruct Step {it}] PSNR: {c_psnr:.4f} | SSIM: {c_ssim:.4f} | LPIPS: {c_lpips:.4f} | FVD: {c_fvd:.4f}")
+
+        p_psnr, p_ssim, p_lpips, p_fvd = _calculate_metrics_for_split(all_reals_pred, all_preds_pred)
+        log_(f"✅ [Eval Pred Generation Step {it}] PSNR: {p_psnr:.4f} | SSIM: {p_ssim:.4f} | LPIPS: {p_lpips:.4f} | FVD: {p_fvd:.4f}")
+        
+        if logger is not None:
+            logger.scalar_summary('eval_pred/psnr', p_psnr, it)
+            logger.scalar_summary('eval_pred/ssim', p_ssim, it)
+            logger.scalar_summary('eval_pred/lpips', p_lpips, it)
+            logger.scalar_summary('eval_pred/fvd', p_fvd, it)
+            
+    except Exception as e:
+        log_(f"❌ Evaluation process exception: {str(e)}")
+        
+    finally:
+        del lpips_fn
+        torch.cuda.empty_cache()
 
 
 def set_requires_grad(model, requires_grad):

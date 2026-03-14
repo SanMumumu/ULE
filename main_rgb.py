@@ -506,7 +506,7 @@ def parse_args(input_args=None):
     # Data Args
     parser.add_argument('--data', type=str, default='CITYSCAPES_RGB')
     parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--data_folder', type=str, default='/mnt/nodestor/ws/UniWM/DATA/data')
+    parser.add_argument('--data_folder', type=str, default='/mnt/data/wangsen/SyncVP/data')
 
     # VAE Args
     parser.add_argument('--vae_config', type=str, default='configs/model.yaml')
