@@ -405,7 +405,7 @@ def main(rank, args):
         # =========================================================================
         # Periodic Video Generation and Visualization
         # =========================================================================
-        if rank == 0 and it % args.eval_freq == 0 and it > 0:
+        if rank == 0 and (it + 1) % args.eval_freq == 0 and it > 0:
             model.eval() 
             with torch.no_grad():
                 try:
@@ -452,7 +452,7 @@ def main(rank, args):
                     flat_combined = flat_combined.view(-1, flat_combined.shape[3], flat_combined.shape[4], flat_combined.shape[5])
                     flat_combined = ((flat_combined + 1.0) / 2.0).clamp(0.0, 1.0)
                     
-                    save_path = os.path.join(args.output, f'vis_e2e_{it:07d}.png')
+                    save_path = os.path.join(args.output, f'vis_e2e_{it+1:07d}.png')
                     torchvision.utils.save_image(flat_combined, save_path, nrow=min_T, normalize=False)
                 except Exception as e:
                     log_(f"❌ Visualization error: {str(e)}")
@@ -462,8 +462,8 @@ def main(rank, args):
         # =========================================================================
         # Save Model Checkpoints
         # =========================================================================
-        if rank == 0 and it % 10000 == 0 and it > 0:
-            ckpt_path = os.path.join(args.output, f'ckpt_{it:07d}.pt')
+        if rank == 0 and (it + 1) % 10000 == 0:
+            ckpt_path = os.path.join(args.output, f'ckpt_{it+1:07d}.pt')
             torch.save({
                 'vae_pred_model': vae_pred_model.module.state_dict(),
                 'vae_cond_model': vae_cond_model.module.state_dict(),
@@ -479,7 +479,7 @@ def main(rank, args):
         # =========================================================================
         # Quantitative Evaluation
         # =========================================================================
-        if rank == 0 and it % args.eval_freq  == 0 and it > 0:
+        if rank == 0 and (it + 1) % args.eval_freq == 0:
             ema.eval(); vae_cond_model.eval(); vae_pred_model.eval()
             
             run_evaluation(
