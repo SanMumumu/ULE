@@ -1,0 +1,42 @@
+# Core DL Framework (Install manually for specific CUDA version if needed)
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# Core Utilities
+packaging
+ninja
+PyYAML
+omegaconf
+protobuf>=3.19.0,<4.0.0
+tqdm
+scikit-learn
+
+# Acceleration & Optimization
+accelerate
+flash-attn>=2.8.3  # Note: Use MAX_JOBS=256 and --no-build-isolation when installing
+
+# Vision & Image Processing
+opencv-python
+imageio
+imageio-ffmpeg
+matplotlib
+
+# Metrics & Logging
+lpips
+tensorboard
+wandb
+
+# Model Libraries (Implied by DiT/Transformer usage in paper)
+transformers
+diffusers
+huggingface_hub
+
+# Other tools
+gdown
+einops
+torchmetrics
+termcolor
+scikit-image
+nvitop
+timm
